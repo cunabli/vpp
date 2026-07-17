@@ -495,6 +495,11 @@ vlib_buffer_pool_get (vlib_main_t * vm, u8 buffer_pool_index, u32 * buffers,
   vlib_buffer_pool_t *bp = vlib_get_buffer_pool (vm, buffer_pool_index);
   u32 len;
 
+  /* External backend owns the main pool: draw from it instead of bp->buffers.
+     May return fewer than requested; the caller honors the partial result. */
+  if (PREDICT_FALSE (bp->backend_ops.alloc != 0))
+    return bp->backend_ops.alloc (vm, bp, buffers, n_buffers);
+
   ASSERT (bp->buffers);
 
   clib_spinlock_lock (&bp->lock);
@@ -728,6 +733,14 @@ vlib_buffer_pool_put (vlib_main_t * vm, u8 buffer_pool_index,
   vlib_buffer_copy_indices (bpt->cached_buffers + n_cached,
 			    buffers + n_buffers - n_empty, n_empty);
   bpt->n_cached = VLIB_BUFFER_POOL_PER_THREAD_CACHE_SZ;
+
+  /* Cache is full; return the overflow.  Under an external backend the
+     overflow goes back to the backend, not to bp->buffers. */
+  if (PREDICT_FALSE (bp->backend_ops.free != 0))
+    {
+      bp->backend_ops.free (vm, bp, buffers, n_buffers - n_empty);
+      return;
+    }
 
   clib_spinlock_lock (&bp->lock);
   vlib_buffer_copy_indices (bp->buffers + bp->n_avail, buffers,

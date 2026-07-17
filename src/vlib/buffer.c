@@ -1012,4 +1012,22 @@ vlib_buffer_set_alloc_free_callback (
   return 0;
 }
 
+__clib_export int
+vlib_buffer_pool_set_backend_ops (vlib_main_t *vm, u8 buffer_pool_index,
+				  vlib_buffer_pool_backend_ops_t ops)
+{
+  vlib_buffer_main_t *bm = vm->buffer_main;
+  vlib_buffer_pool_t *bp;
+
+  if (buffer_pool_index >= vec_len (bm->buffer_pools))
+    return -1;
+  /* both or neither: a backend that allocs but can't free would leak */
+  if ((ops.alloc != 0) != (ops.free != 0))
+    return -2;
+
+  bp = vec_elt_at_index (bm->buffer_pools, buffer_pool_index);
+  bp->backend_ops = ops;
+  return 0;
+}
+
 /** @endcond */

@@ -431,7 +431,35 @@ typedef struct
   u32 n_cached;
 } vlib_buffer_pool_thread_t;
 
+/* Forward declaration for the per-pool backend ops. */
+struct vlib_buffer_pool_t_;
+
+/* Per-buffer-pool allocation backend (override) ops.  Distinct from the
+   observational alloc/free callbacks (vlib_buffer_set_alloc_free_callback):
+   when set, these *replace* the main-pool draw/return that sits underneath
+   the per-thread cache, letting an external allocator (e.g. a DPAA2/QBMan
+   hardware buffer pool) own the buffers.  Contract:
+   - alloc() returns how many of n_buffers it could supply (0..n_buffers);
+     partial results are honored — the caller falls back to its normal path
+     for the remainder rather than failing the whole request.
+   - free() takes back the buffers the per-thread cache overflowed; the cache
+     fill/trim logic itself stays in vlib and is unchanged.
+   The per-thread cache still sits above these ops, so bufmon and the
+   observational callbacks keep working alongside a registered backend. */
+typedef u32 (vlib_buffer_pool_alloc_fn_t) (struct vlib_main_t *vm,
+					   struct vlib_buffer_pool_t_ *bp,
+					   u32 *buffers, u32 n_buffers);
+typedef void (vlib_buffer_pool_free_fn_t) (struct vlib_main_t *vm,
+					   struct vlib_buffer_pool_t_ *bp,
+					   u32 *buffers, u32 n_buffers);
+
 typedef struct
+{
+  vlib_buffer_pool_alloc_fn_t *alloc;
+  vlib_buffer_pool_free_fn_t *free;
+} vlib_buffer_pool_backend_ops_t;
+
+typedef struct vlib_buffer_pool_t_
 {
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
   uword start;
@@ -453,6 +481,9 @@ typedef struct
 
   /* buffer metadata template */
   vlib_buffer_template_t buffer_template;
+
+  /* optional external allocation backend; alloc == 0 means none (default) */
+  vlib_buffer_pool_backend_ops_t backend_ops;
 } vlib_buffer_pool_t;
 
 #define VLIB_BUFFER_MAX_NUMA_NODES 32
@@ -500,6 +531,13 @@ format_function_t format_vlib_buffer_pool_all;
 int vlib_buffer_set_alloc_free_callback (
   struct vlib_main_t *vm, vlib_buffer_alloc_free_callback_t *alloc_callback_fn,
   vlib_buffer_alloc_free_callback_t *free_callback_fn);
+
+/* Register (or, with a zeroed ops, deregister) the external allocation
+   backend for one buffer pool.  Returns 0 on success, -1 if the pool index
+   is unknown, -2 if exactly one of alloc/free is set (both or neither). */
+int vlib_buffer_pool_set_backend_ops (struct vlib_main_t *vm,
+				      u8 buffer_pool_index,
+				      vlib_buffer_pool_backend_ops_t ops);
 
 extern u16 __vlib_buffer_external_hdr_size;
 #define VLIB_BUFFER_SET_EXT_HDR_SIZE(x) \
