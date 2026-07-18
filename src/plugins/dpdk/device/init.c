@@ -1570,6 +1570,14 @@ dpdk_config (vlib_main_t * vm, unformat_input_t * input)
   if ((error = dpdk_buffer_pools_create (vm)))
     return error;
 
+  /* attach the vlib alloc/free backend to any hardware-backed (DPBP) pool.
+     No-op when no hardware pool exists (design D4).  dpdk buffer pools are
+     process-lifetime, so the matching dpdk_buffer_deregister_hw_backend() has
+     no runtime teardown call site here; QBMan buffer accounting across
+     interface delete/re-add is verified at bring-up. */
+  if ((error = dpdk_buffer_register_hw_backend (vm)))
+    return error;
+
   return 0;
 }
 
