@@ -23,6 +23,7 @@ add_vpp_plugin(unittest
   bier_test.c
   bihash_test.c
   bitmap_test.c
+  buffer_backend_test.c
   crypto/aes_cbc.c
   crypto/aes_ctr.c
   crypto/aes_gcm.c
