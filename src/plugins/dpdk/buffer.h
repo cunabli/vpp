@@ -14,6 +14,9 @@ extern struct rte_mempool **dpdk_no_cache_mempool_by_buffer_pool_index;
 
 clib_error_t *dpdk_buffer_pools_create (vlib_main_t * vm);
 
+clib_error_t *dpdk_buffer_register_hw_backend (vlib_main_t * vm);
+void dpdk_buffer_deregister_hw_backend (vlib_main_t * vm);
+
 #endif /* include_dpdk_buffer_h */
 
 /** @endcond */
