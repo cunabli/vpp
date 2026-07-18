@@ -90,6 +90,24 @@ buffer_backend_test (vlib_main_t *vm, unformat_input_t *input,
   int registered = 0;
 
   bp = vlib_get_buffer_pool (vm, pool_index);
+
+  /* Refuse to run against a pool that already has a backend (e.g. the DPAA2
+     DPBP pool).  This test *installs its own* backend and deregisters it on
+     the way out, which would clobber the real one and leave the pool with no
+     backend and n_avail == 0 -- i.e. permanently unable to allocate for the
+     rest of this VPP run.  The stock-path semantics it checks are also not
+     observable here: bb_pool_count() reads bp->n_avail, which a
+     backend-owned pool deliberately keeps at 0. */
+  if (bp->backend_ops.alloc || bp->backend_ops.free)
+    {
+      vlib_cli_output (vm,
+		       "buffer-backend unit test skipped: pool %u is already "
+		       "backend-owned (hardware pool); this test needs a "
+		       "stock vlib pool",
+		       pool_index);
+      return 0;
+    }
+
   count_before = bb_pool_count (bp);
   BB_TEST (count_before >= 2048, "pool has enough buffers (%llu)",
 	   count_before);
