@@ -33,8 +33,8 @@ u8 *dpdk_buffer_pool_is_hw = 0;
    rte_mbuf_set_platform_mempool_ops("dpaa2") when a DPBP object exists, which
    makes best_mempool_ops() differ from the compiled-in default.  That
    difference is our signal to build a hardware-backed pool.
-   ponytail: heuristic keys on best!=default; an explicit --mbuf-pool-ops-name
-   would also trip it, which is acceptable (that is the operator asking for it). */
+   Note this keys on best != default, so an explicit --mbuf-pool-ops-name
+   also selects this path -- which is the operator asking for it. */
 static const char *
 dpdk_hw_pool_ops_name (void)
 {
@@ -52,7 +52,7 @@ struct dpdk_rewrite_args
 
 /* rte_mempool_obj_iter callback: rebuild bp->buffers[] in the mempool's object
    order.  Address-derived, so it is correct regardless of the order in which
-   rte_mempool_populate_iova enumerated objects (design D2). */
+   rte_mempool_populate_iova enumerated objects. */
 static void
 dpdk_rewrite_vlib_bufs (struct rte_mempool *mp, void *opaque, void *obj,
 			unsigned i)
@@ -62,9 +62,9 @@ dpdk_rewrite_vlib_bufs (struct rte_mempool *mp, void *opaque, void *obj,
   args->bp->buffers[i] = vlib_get_buffer_index (args->vm, b);
 }
 
-/* Hardware-backed pool init (design D2): the buffers live in a QBMan/DPBP
-   mempool with platform ops, so net/dpaa2 RX queue setup can resolve a bpid.
-   The stock "vpp"/"vpp-no-cache" pair is skipped — QBMan owns the pool. */
+/* Hardware-backed pool init: the buffers live in a QBMan/DPBP mempool with
+   platform ops, so net/dpaa2 RX queue setup can resolve a bpid.  The stock
+   "vpp"/"vpp-no-cache" pair is skipped — QBMan owns the pool. */
 static clib_error_t *
 dpdk_hw_buffer_pool_init (vlib_main_t *vm, vlib_buffer_pool_t *bp,
 			  const char *mp_ops_name)
@@ -100,7 +100,16 @@ dpdk_hw_buffer_pool_init (vlib_main_t *vm, vlib_buffer_pool_t *bp,
 
   dpdk_mempool_by_buffer_pool_index[bp->index] = mp;
   dpdk_no_cache_mempool_by_buffer_pool_index[bp->index] = 0;
-  mp->pool_id = bp->index;
+
+  /* Deliberately NOT setting mp->pool_id here.  It is a union with pool_data
+     (rte_mempool.h), and on this path the pool's ops belong to the platform
+     driver, which owns pool_data: net/dpaa2 stores its bp_info there during
+     .alloc and dereferences it on every TX.  Writing pool_id would be
+     clobbered by .alloc during populate below, and in the reverse order it
+     corrupts the driver's pointer.  Nothing reads pool_id for a HW pool
+     anyway -- every reader lives in the "vpp" / "vpp-no-cache" ops, which
+     only the software path registers.  Use
+     dpdk_mempool_by_buffer_pool_index[] for mp lookup instead. */
 
   /* platform ops (e.g. "dpaa2") — resolves a bpid net/dpaa2 RX requires */
   rte_mempool_set_ops_byname (mp, mp_ops_name, NULL);
@@ -148,7 +157,7 @@ dpdk_hw_buffer_pool_init (vlib_main_t *vm, vlib_buffer_pool_t *bp,
 		 buffer_mem_start, *bp->buffers, 0)),
 	       sizeof (struct rte_mbuf));
 
-  /* stamp vlib templates and verify index round-trip for every object (D2) */
+  /* stamp vlib templates and verify index round-trip for every object */
   for (i = 0; i < mp->populated_size; i++)
     {
       vlib_buffer_t *b =
@@ -162,8 +171,8 @@ dpdk_hw_buffer_pool_init (vlib_main_t *vm, vlib_buffer_pool_t *bp,
   bp->n_avail = 0;
   dpdk_buffer_pool_is_hw[bp->index] = 1;
 
-  /* D3 sizing: no MC per-pool cap exists — the bound is the seeded physmem.
-     Report requested vs populated (QBMan acquire/release batch is 7). */
+  /* Pool sizing is bounded by the seeded physmem, not by any MC per-pool cap,
+     so report requested vs populated. */
   vlib_log_notice (vm->buffer_main->log_default,
 		   "HW buffer pool %u (%s): requested %u, populated %u buffers",
 		   bp->index, mp_ops_name, bp->n_buffers, mp->populated_size);
@@ -187,8 +196,8 @@ dpdk_hw_pool_alloc (vlib_main_t *vm, vlib_buffer_pool_t *bp, u32 *buffers,
       u32 avail = rte_mempool_avail_count (mp);
       if (n > avail)
 	n = avail;
-      /* ponytail: on a concurrent-drain race get_bulk fails and we stop here;
-	 the caller falls back to its normal path for the remainder. */
+      /* On a concurrent-drain race get_bulk fails and we stop here; the
+	 caller falls back to its normal path for the remainder. */
       if (n == 0 || rte_mempool_get_bulk (mp, (void **) mb, n))
 	break;
       vlib_get_buffer_indices_with_offset (vm, (void **) mb, buffers + n_done,
@@ -603,7 +612,7 @@ dpdk_ops_vpp_get_count_no_cache (const struct rte_mempool *mp)
 }
 
 /* Attach the vlib alloc/free backend ops to every hardware-backed pool.
-   Called post-pool-create from the dpdk init path (design D4). */
+   Called post-pool-create from the dpdk init path. */
 clib_error_t *
 dpdk_buffer_register_hw_backend (vlib_main_t *vm)
 {
@@ -622,7 +631,7 @@ dpdk_buffer_register_hw_backend (vlib_main_t *vm)
   return 0;
 }
 
-/* Detach the backend ops (teardown / interface delete-re-add, design D4). */
+/* Detach the backend ops (teardown / interface delete-re-add). */
 void
 dpdk_buffer_deregister_hw_backend (vlib_main_t *vm)
 {
