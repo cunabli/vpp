@@ -179,7 +179,18 @@ VLIB_NODE_FN (l2flood_node) (vlib_main_t * vm,
 	      if ((member->sw_if_index != sw_if_index0) &&
 		  (!in_shg || (member->shg != in_shg)))
 		{
-		  vec_add1 (msm->members[thread_index], member);
+		  vnet_hw_interface_t *hi;
+
+		  /*
+		   * Skip members that cannot transmit. Replicating to a
+		   * down member costs a clone and a walk to <if>-output,
+		   * which drops it and charges the interface a tx-error.
+		   * Admin-down implies link-down, so this covers both.
+		   */
+		  hi = vnet_get_sup_hw_interface (msm->vnet_main,
+						  member->sw_if_index);
+		  if (hi->flags & VNET_HW_INTERFACE_FLAG_LINK_UP)
+		    vec_add1 (msm->members[thread_index], member);
 		}
 	    }
 
