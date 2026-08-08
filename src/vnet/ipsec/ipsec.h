@@ -24,6 +24,43 @@
 #define IPSEC_FP_IP4_HASHES_POOL_SIZE 128
 #define IPSEC_FP_IP6_HASHES_POOL_SIZE 128
 
+/*
+ * ESP protocol-offload provider registration.
+ *
+ * A provider is a component (e.g. a hardware plugin) that can perform the whole
+ * ESP transform for an SA -- encap/decap, crypto, IV and sequence bookkeeping,
+ * anti-replay -- rather than just the crypto primitive. IPsec forwarding stays
+ * in the graph; a provider steers the SAs it owns to its own path.
+ *
+ * The crypto-engine seam only delegates crypto operations, and a graph node is
+ * invoked per packet, never on SA delete -- so neither can give a provider the
+ * per-SA lifecycle signal it needs to create and, above all, destroy its
+ * offload session exactly when the SA appears and disappears. This registry is
+ * that signal: on SA add the core offers the SA to each provider (check_support
+ * gates it) so the provider may create its session; on SA delete the core
+ * notifies every provider so the owning one tears the session down. Without it
+ * an offload session would outlive its SA and leak.
+ */
+typedef int (*ipsec_esp_offload_check_support_fn) (ipsec_sa_t *sa);
+typedef void (*ipsec_esp_offload_session_fn) (u32 sa_index, int is_add);
+
+typedef struct
+{
+  char *name;
+  /* Return nonzero if this provider can offload the given SA. May be NULL,
+     meaning "always offered" -- the provider then self-gates in
+     session_add_del. */
+  ipsec_esp_offload_check_support_fn check_support;
+  /* Per-SA lifecycle: is_add=1 on SA create (after check_support passed),
+     is_add=0 on SA delete (broadcast to all providers; a provider that never
+     claimed the SA must no-op). */
+  ipsec_esp_offload_session_fn session_add_del;
+} ipsec_esp_offload_provider_t;
+
+/* Register an ESP offload provider. Returns its index. */
+u32 ipsec_register_esp_offload_provider (
+  vlib_main_t *vm, const ipsec_esp_offload_provider_t *provider);
+
 typedef struct
 {
   u64 key[2];
@@ -181,6 +218,9 @@ typedef struct
   ipsec_sa_t *sa_pool;
   ipsec_sa_inb_rt_t **inb_sa_runtimes;
   ipsec_sa_outb_rt_t **outb_sa_runtimes;
+
+  /* Registered ESP protocol-offload providers (see registration API above). */
+  ipsec_esp_offload_provider_t *esp_offload_providers;
 } ipsec_main_t;
 
 typedef enum ipsec_format_flags_t_
