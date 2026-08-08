@@ -8,12 +8,14 @@
 #include <vlib/vlib.h>
 #include <vnet/plugin/plugin.h>
 
+/* Include the plugin header (and the vnet headers it pulls in, which use the
+ * always_inline macro) before DPDK undefines that macro for its own headers. */
+#include "dpaa2_ipsec.h"
+
 #include <dpdk/device/dpdk.h>
 #undef always_inline
 #include <rte_cryptodev.h>
 #include <rte_config.h>
-
-#include "dpaa2_ipsec.h"
 
 #if CLIB_DEBUG > 0
 #define always_inline static inline
@@ -41,6 +43,7 @@ dpaa2_ipsec_scan_devs (void)
 
   vec_reset_length (dm->devs);
   dm->have_security_dev = 0;
+  dm->sec_dev_id = DPAA2_IPSEC_INVALID_U16;
 
   for (u32 i = 0; i < n; i++)
     {
@@ -61,7 +64,11 @@ dpaa2_ipsec_scan_devs (void)
       dev->n_offload_qp = 0;
 
       if (dev->security)
-	dm->have_security_dev = 1;
+	{
+	  dm->have_security_dev = 1;
+	  if (dm->sec_dev_id == DPAA2_IPSEC_INVALID_U16)
+	    dm->sec_dev_id = i;
+	}
 
       log_debug ("cryptodev %u (%s): %u qp, protocol offload %s", i,
 		 dev->name, dev->max_qp,
@@ -148,6 +155,11 @@ dpaa2_ipsec_init (vlib_main_t *vm)
   dpaa2_ipsec_main_t *dm = &dpaa2_ipsec_main;
 
   dm->log_class = dpaa2_ipsec_log.class;
+
+  /* Register as an ESP offload provider. This only installs callbacks; the
+   * device scan and session pool are done lazily on first SA add, when the
+   * cryptodev engine has already brought the device up. */
+  dpaa2_ipsec_session_init ();
 
   return 0;
 }
