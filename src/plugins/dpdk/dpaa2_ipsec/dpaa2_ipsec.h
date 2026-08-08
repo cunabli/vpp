@@ -22,6 +22,7 @@
 
 #include <vlib/vlib.h>
 #include <vnet/vnet.h>
+#include <vnet/ipsec/ipsec_sa.h>
 
 #define DPAA2_IPSEC_INVALID_U16 ((u16) ~0)
 
@@ -43,7 +44,6 @@ typedef enum
   _ (NO_SECURITY_DEV, "no SECURITY-capable cryptodev for this SA")            \
   _ (UNSUPPORTED_CONFIG, "SA config not accepted by rte_security")            \
   _ (WINDOW_TOO_LARGE, "anti-replay window exceeds device maximum")           \
-  _ (FAMILY_UNPROVEN, "IPv6 tunnel not yet proven on this device")            \
   _ (SESSION_CREATE_FAILED, "rte_security session create failed")
 
 typedef enum
@@ -60,6 +60,14 @@ typedef struct
   u8 decision; /* dpaa2_ipsec_route_decision_t */
   u8 reason;   /* dpaa2_ipsec_fallback_reason_t */
 } dpaa2_ipsec_sa_route_t;
+
+/* Per-SA rte_security sessions, one per direction (opaque rte_security_session*).
+ * The demux picks egress on the encrypt path, ingress on the decrypt path. */
+typedef struct
+{
+  void *egress;
+  void *ingress;
+} dpaa2_ipsec_sa_sess_t;
 
 /* Per-device capability record, one per rte_cryptodev. Offload availability is
  * a per-device property (does it advertise the SECURITY feature), not a global
@@ -98,12 +106,22 @@ typedef struct
   dpaa2_ipsec_dev_t *devs;	    /* per-device capability records */
   dpaa2_ipsec_worker_t *workers;    /* per-thread SEC placement, by thread */
   dpaa2_ipsec_sa_route_t *sa_route; /* per-SA routing cache, by sa_index */
+  /* Per-SA rte_security sessions, one per direction (SEC sessions are
+   * directional; a tunnel-protect SA can be sa-out on one tunnel and sa-in on
+   * another), indexed by sa_index. Both NULL when the SA is not offloaded. */
+  dpaa2_ipsec_sa_sess_t *sa_session;
+
+  void *session_pool; /* rte_security session mempool, created on first use */
+  /* Device sessions are created on; INVALID until the scan finds a
+   * SECURITY-capable device. Single-device for now. */
+  u16 sec_dev_id;
 
   /* When set, SEC ESP offload is disabled and every SA uses the async fallback;
    * default 0 (offload enabled, capability-only). Global on/off lever -- there
    * is deliberately no per-packet size gate (see the file header). */
   u8 offload_disabled;
   u8 have_security_dev; /* scan found a SECURITY-capable device */
+  u8 scanned;		/* one-time lazy device scan + placement done */
 
   vlib_log_class_t log_class;
 } dpaa2_ipsec_main_t;
@@ -117,5 +135,15 @@ void dpaa2_ipsec_scan_devs (void);
 /* Assign each vlib worker a SEC queue-pair on a SECURITY-capable device and
  * compute each device's base_qp offset past the async engine's claim. */
 void dpaa2_ipsec_place_workers (void);
+
+/* Single source of truth for the per-SA offload decision. Returns nonzero if
+ * the SA can be offloaded; on a zero return, *reason says why it falls back.
+ * Consulted by the provider's check_support and by the show command. */
+int dpaa2_ipsec_offload_gate (ipsec_sa_t *sa,
+			      dpaa2_ipsec_fallback_reason_t *reason);
+
+/* Register as an ESP offload provider and create the session mempool. Called
+ * from init once a SECURITY-capable device is present. */
+void dpaa2_ipsec_session_init (void);
 
 #endif /* __DPAA2_IPSEC_H__ */

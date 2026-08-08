@@ -141,6 +141,7 @@ add_vpp_plugin(dpdk
   device/node.c
   ${DPDK_CRYPTODEV_SOURCE}
   dpaa2_ipsec/dpaa2_ipsec.c
+  dpaa2_ipsec/dpaa2_ipsec_session.c
 
   MULTIARCH_SOURCES
   buffer.c
