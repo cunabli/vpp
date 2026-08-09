@@ -592,6 +592,15 @@ dpaa2_ipsec_poll_inline (vlib_main_t *vm, vlib_node_runtime_t *node)
 	    /* Tunnel encap: SEC produced the outer ESP packet; the tunnel
 	     * midchain adjacency (still in adj_index[VLIB_TX]) sends it out. */
 	    next = DPAA2_IPSEC_POLL_NEXT_MIDCHAIN_TX;
+
+	  /* Feed the core per-SA counter (the one the built-in ESP nodes feed)
+	   * so an offloaded SA shows packets/bytes in `show ipsec sa` too. On
+	   * completion, successful transforms only, with the on-wire length.
+	   * ponytail: per-packet increment; batch same-SA runs only if the perf
+	   * pass (4.1) shows it matters. */
+	  vlib_increment_combined_counter (&ipsec_sa_counters, thread_index,
+					   vnet_buffer (b)->ipsec.sad_index, 1,
+					   vlib_buffer_length_in_chain (vm, b));
 	}
 
       bufs[i] = vlib_get_buffer_index (vm, b);
@@ -648,3 +657,61 @@ VLIB_REGISTER_NODE (dpaa2_ipsec_poll_node) = {
     [DPAA2_IPSEC_POLL_NEXT_DROP] = "error-drop",
   },
 };
+
+/* Sum one node error counter across all workers, net of the last `clear` --
+ * the same read the `show errors` command does. */
+static u64
+dpaa2_ipsec_sum_error (vlib_main_t *vm, u32 node_index, u32 err)
+{
+  vlib_node_t *n = vlib_get_node (vm, node_index);
+  u32 idx = n->error_heap_index + err;
+  u64 total = 0;
+
+  foreach_vlib_main ()
+    {
+      vlib_error_main_t *em = &this_vlib_main->error_main;
+      u64 c = em->counters[idx];
+      if (idx < vec_len (em->counters_last_clear))
+	c -= em->counters_last_clear[idx];
+      total += c;
+    }
+  return total;
+}
+
+void
+dpaa2_ipsec_get_stats (dpaa2_ipsec_stats_t *s)
+{
+  vlib_main_t *vm = vlib_get_main ();
+  u32 demux[4] = {
+    dpaa2_esp4_encrypt_tun_node.index,
+    dpaa2_esp6_encrypt_tun_node.index,
+    dpaa2_esp4_decrypt_tun_node.index,
+    dpaa2_esp6_decrypt_tun_node.index,
+  };
+  u32 poll = dpaa2_ipsec_poll_node.index;
+
+  clib_memset (s, 0, sizeof (*s));
+
+  /* The four demux nodes share one error enum; sum each counter over all of
+   * them so the totals are direction/family agnostic. */
+  for (int i = 0; i < 4; i++)
+    {
+      s->rx += dpaa2_ipsec_sum_error (vm, demux[i], DPAA2_IPSEC_ERROR_RX);
+      s->offloaded +=
+	dpaa2_ipsec_sum_error (vm, demux[i], DPAA2_IPSEC_ERROR_OFFLOAD);
+      s->handoff +=
+	dpaa2_ipsec_sum_error (vm, demux[i], DPAA2_IPSEC_ERROR_HANDOFF);
+      s->fallback +=
+	dpaa2_ipsec_sum_error (vm, demux[i], DPAA2_IPSEC_ERROR_FALLBACK);
+      s->cop_fallback +=
+	dpaa2_ipsec_sum_error (vm, demux[i], DPAA2_IPSEC_ERROR_COP_ALLOC);
+      s->enq_drop +=
+	dpaa2_ipsec_sum_error (vm, demux[i], DPAA2_IPSEC_ERROR_ENQ_FAIL);
+    }
+
+  s->dequeued = dpaa2_ipsec_sum_error (vm, poll, DPAA2_IPSEC_POLL_ERROR_DEQ);
+  s->auth_fail =
+    dpaa2_ipsec_sum_error (vm, poll, DPAA2_IPSEC_POLL_ERROR_AUTH_FAIL);
+  s->status_fail =
+    dpaa2_ipsec_sum_error (vm, poll, DPAA2_IPSEC_POLL_ERROR_STATUS_FAIL);
+}
