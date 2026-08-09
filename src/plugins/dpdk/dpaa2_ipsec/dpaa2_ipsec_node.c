@@ -48,6 +48,9 @@
 #define always_inline static inline __attribute__ ((__always_inline__))
 #endif
 
+/* The demux (producer) arms this poll node (consumer) after each enqueue. */
+extern vlib_node_registration_t dpaa2_ipsec_poll_node;
+
 /* Crypto ops per worker pool. One op per in-flight offloaded packet, so this
  * caps a worker's SEC-inflight depth; sized above a full vector plus headroom
  * for the split-phase (enqueued-but-not-dequeued) window. */
@@ -321,6 +324,11 @@ dpaa2_ipsec_offload_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	rte_cryptodev_enqueue_burst (w->dev_id, w->qp_id, ops, (u16) n_off);
       w->inflight += n_enq;
 
+      if (n_enq)
+	/* Wake this worker's poll node to drain what we just queued (D2'
+	 * self-gating: the producer arms the interrupt INPUT consumer). */
+	vlib_node_set_interrupt_pending (vm, dpaa2_ipsec_poll_node.index);
+
       if (PREDICT_FALSE (n_enq < n_off))
 	{
 	  /* SEC queue-pair full: drop the un-enqueued packets (bounded, no worker
@@ -442,5 +450,199 @@ VLIB_REGISTER_NODE (dpaa2_esp6_decrypt_tun_node) = {
     [DPAA2_IPSEC_NEXT_FALLBACK] = "esp6-decrypt-tun",
     [DPAA2_IPSEC_NEXT_HANDOFF] = "esp6-decrypt-tun-handoff",
     [DPAA2_IPSEC_NEXT_DROP] = "error-drop",
+  },
+};
+
+/*
+ * Poll node: the split-phase back half. SEC processes enqueued ops
+ * asynchronously and DMAs each completed packet back; this per-worker node
+ * dequeues those completions and re-injects the packets into the graph.
+ *
+ * It self-gates like the in-tree async engine's `crypto-deq`: an INTERRUPT
+ * INPUT node, quiescent until the demux (producer) arms it on enqueue, and
+ * re-arming itself while SEC still holds ops (tracked by w->inflight -- no
+ * per-SA refcount). Re-entry mirrors the built-in nodes: a decap'd inner
+ * packet routes by its IP version, an encap'd outer packet rides the tunnel's
+ * midchain adjacency out.
+ */
+
+#define foreach_dpaa2_ipsec_poll_next                                         \
+  _ (IP4_INPUT, "ip4-input-no-checksum")                                      \
+  _ (IP6_INPUT, "ip6-input")                                                  \
+  _ (MIDCHAIN_TX, "adj-midchain-tx")                                          \
+  _ (DROP, "error-drop")
+
+typedef enum
+{
+#define _(n, s) DPAA2_IPSEC_POLL_NEXT_##n,
+  foreach_dpaa2_ipsec_poll_next
+#undef _
+    DPAA2_IPSEC_POLL_N_NEXT,
+} dpaa2_ipsec_poll_next_t;
+
+#define foreach_dpaa2_ipsec_poll_error                                        \
+  _ (DEQ, "completions dequeued from SEC")                                    \
+  _ (AUTH_FAIL, "SEC authentication failed (dropped)")                        \
+  _ (STATUS_FAIL, "SEC operation failed (dropped)")
+
+typedef enum
+{
+#define _(n, s) DPAA2_IPSEC_POLL_ERROR_##n,
+  foreach_dpaa2_ipsec_poll_error
+#undef _
+    DPAA2_IPSEC_POLL_N_ERROR,
+} dpaa2_ipsec_poll_error_t;
+
+static char *dpaa2_ipsec_poll_error_strings[] = {
+#define _(n, s) s,
+  foreach_dpaa2_ipsec_poll_error
+#undef _
+};
+
+/* Fold the transform SEC applied back into the vlib buffer. SEC moved the
+ * packet start (decap strips the outer+ESP, encap prepends them) and set the
+ * new length in the mbuf; recover both, using the same computation the dpdk
+ * plugin's own RX path uses to derive a vlib buffer from an mbuf
+ * (device/node.c) -- and the exact inverse of the enqueue-side sync, since the
+ * CMake gate pins RTE_PKTMBUF_HEADROOM == VLIB_BUFFER_PRE_DATA_SIZE.
+ * ponytail: single-seg -- rebuilds only the first segment's geometry. SEC
+ * returns the ESP packet in one segment for MTU-sized traffic; add a chain
+ * walk (next-buffer links + total_length) only if jumbo offload is enabled. */
+static_always_inline void
+dpaa2_ipsec_buffer_resync (vlib_buffer_t *b, struct rte_mbuf *mb)
+{
+  b->current_data = mb->data_off - RTE_PKTMBUF_HEADROOM;
+  b->current_length = mb->data_len;
+}
+
+static_always_inline uword
+dpaa2_ipsec_poll_inline (vlib_main_t *vm, vlib_node_runtime_t *node)
+{
+  dpaa2_ipsec_main_t *dm = &dpaa2_ipsec_main;
+  u32 thread_index = vm->thread_index;
+  dpaa2_ipsec_worker_t *w = (thread_index < vec_len (dm->workers))
+			      ? vec_elt_at_index (dm->workers, thread_index)
+			      : 0;
+
+  if (w == 0 || w->dev_id == DPAA2_IPSEC_INVALID_U16 || w->inflight == 0)
+    return 0;
+
+  struct rte_crypto_op *ops[VLIB_FRAME_SIZE];
+  u16 burst = w->inflight < VLIB_FRAME_SIZE ? w->inflight : VLIB_FRAME_SIZE;
+  u16 n_deq = rte_cryptodev_dequeue_burst (w->dev_id, w->qp_id, ops, burst);
+
+  if (n_deq == 0)
+    {
+      /* SEC still holds ops -- stay scheduled until they drain. */
+      vlib_node_set_interrupt_pending (vm, node->node_index);
+      return 0;
+    }
+
+  u32 bufs[VLIB_FRAME_SIZE];
+  u16 nexts[VLIB_FRAME_SIZE];
+  u32 n_auth_fail = 0, n_status_fail = 0;
+
+  for (u16 i = 0; i < n_deq; i++)
+    {
+      struct rte_crypto_op *op = ops[i];
+      struct rte_mbuf *mb = op->sym->m_src;
+      vlib_buffer_t *b = vlib_buffer_from_rte_mbuf (mb);
+      u16 next;
+
+      /* D6' SW lever: prefetch a later completion's head while we work the
+       * current one, hiding the post-DMA cold miss the HW stash did not cover.
+       * ponytail: fixed stride 4; the stride and the stash/prefetch split are
+       * tuning knobs measured on-silicon in task 4.1, not constants. */
+      if (i + 4 < n_deq)
+	CLIB_PREFETCH (rte_pktmbuf_mtod (ops[i + 4]->sym->m_src, void *),
+		       CLIB_CACHE_LINE_BYTES, LOAD);
+
+      dpaa2_ipsec_buffer_resync (b, mb);
+
+      if (PREDICT_FALSE (op->status != RTE_CRYPTO_OP_STATUS_SUCCESS))
+	{
+	  next = DPAA2_IPSEC_POLL_NEXT_DROP;
+	  if (op->status == RTE_CRYPTO_OP_STATUS_AUTH_FAILED)
+	    n_auth_fail += 1;
+	  else
+	    n_status_fail += 1;
+	}
+      else
+	{
+	  /* Direction is carried per-op via the attached session, not the SA's
+	   * IS_INBOUND flag: a tunnel-protect SA is used both ways under one
+	   * sa_index and one flag. The op keeps the session we attached (the PMD
+	   * preserves op->sym->session), so a decap completion is the one holding
+	   * this SA's ingress session. sad_index addresses a stable (never-unmapped)
+	   * pool slot even if the SA was deleted in-flight, so the compare is safe. */
+	  u32 sad = vnet_buffer (b)->ipsec.sad_index;
+	  int is_dec = sad < vec_len (dm->sa_session) &&
+		       op->sym->session == dm->sa_session[sad].ingress;
+	  if (is_dec)
+	    {
+	      /* Tunnel decap: SEC handed us the inner packet; route by its IP
+	       * version, as the built-in decrypt-tun node does. */
+	      u8 *ih = vlib_buffer_get_current (b);
+	      next = ((ih[0] >> 4) == 6) ? DPAA2_IPSEC_POLL_NEXT_IP6_INPUT
+					 : DPAA2_IPSEC_POLL_NEXT_IP4_INPUT;
+	    }
+	  else
+	    /* Tunnel encap: SEC produced the outer ESP packet; the tunnel
+	     * midchain adjacency (still in adj_index[VLIB_TX]) sends it out. */
+	    next = DPAA2_IPSEC_POLL_NEXT_MIDCHAIN_TX;
+	}
+
+      bufs[i] = vlib_get_buffer_index (vm, b);
+      nexts[i] = next;
+
+      if (PREDICT_FALSE (b->flags & VLIB_BUFFER_IS_TRACED))
+	{
+	  dpaa2_ipsec_trace_t *t = vlib_add_trace (vm, node, b, sizeof (*t));
+	  t->sa_index = vnet_buffer (b)->ipsec.sad_index;
+	  t->offloaded = 1;
+	}
+    }
+
+  w->inflight -= n_deq;
+  rte_mempool_put_bulk (w->cop_pool, (void **) ops, n_deq);
+
+  vlib_buffer_enqueue_to_next (vm, node, bufs, nexts, n_deq);
+
+  vlib_node_increment_counter (vm, node->node_index,
+			       DPAA2_IPSEC_POLL_ERROR_DEQ, n_deq);
+  if (n_auth_fail)
+    vlib_node_increment_counter (vm, node->node_index,
+				 DPAA2_IPSEC_POLL_ERROR_AUTH_FAIL, n_auth_fail);
+  if (n_status_fail)
+    vlib_node_increment_counter (vm, node->node_index,
+				 DPAA2_IPSEC_POLL_ERROR_STATUS_FAIL,
+				 n_status_fail);
+
+  /* More may still be in SEC -- stay scheduled until inflight hits zero. */
+  if (w->inflight)
+    vlib_node_set_interrupt_pending (vm, node->node_index);
+
+  return n_deq;
+}
+
+VLIB_NODE_FN (dpaa2_ipsec_poll_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return dpaa2_ipsec_poll_inline (vm, node);
+}
+
+VLIB_REGISTER_NODE (dpaa2_ipsec_poll_node) = {
+  .name = "dpaa2-ipsec-poll",
+  .type = VLIB_NODE_TYPE_INPUT,
+  .state = VLIB_NODE_STATE_INTERRUPT,
+  .format_trace = format_dpaa2_ipsec_trace,
+  .n_errors = DPAA2_IPSEC_POLL_N_ERROR,
+  .error_strings = dpaa2_ipsec_poll_error_strings,
+  .n_next_nodes = DPAA2_IPSEC_POLL_N_NEXT,
+  .next_nodes = {
+    [DPAA2_IPSEC_POLL_NEXT_IP4_INPUT] = "ip4-input-no-checksum",
+    [DPAA2_IPSEC_POLL_NEXT_IP6_INPUT] = "ip6-input",
+    [DPAA2_IPSEC_POLL_NEXT_MIDCHAIN_TX] = "adj-midchain-tx",
+    [DPAA2_IPSEC_POLL_NEXT_DROP] = "error-drop",
   },
 };
