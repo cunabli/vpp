@@ -143,6 +143,7 @@ add_vpp_plugin(dpdk
   dpaa2_ipsec/dpaa2_ipsec.c
   dpaa2_ipsec/dpaa2_ipsec_session.c
   dpaa2_ipsec/dpaa2_ipsec_node.c
+  dpaa2_ipsec/dpaa2_ipsec_cli.c
 
   MULTIARCH_SOURCES
   buffer.c

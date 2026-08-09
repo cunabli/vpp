@@ -146,4 +146,23 @@ int dpaa2_ipsec_offload_gate (ipsec_sa_t *sa,
  * from init once a SECURITY-capable device is present. */
 void dpaa2_ipsec_session_init (void);
 
+/* Plugin-wide packet totals, summed across workers from the demux and poll node
+ * counters. Read-only view for the show command. */
+typedef struct
+{
+  u64 rx;	    /* packets that reached the demux nodes */
+  u64 offloaded;    /* enqueued to SEC */
+  u64 handoff;	    /* sent to the SA's pinned worker */
+  u64 fallback;	    /* routed to the software path */
+  u64 cop_fallback; /* fell back because a crypto op could not be allocated */
+  u64 enq_drop;	    /* dropped because the SEC queue-pair was full */
+  u64 dequeued;	    /* completions taken back from SEC */
+  u64 auth_fail;    /* SEC reported an authentication failure */
+  u64 status_fail;  /* SEC reported any other operation failure */
+} dpaa2_ipsec_stats_t;
+
+/* Sum the demux + poll node counters across all workers into *s. Defined in the
+ * node file, which owns the counter indices. */
+void dpaa2_ipsec_get_stats (dpaa2_ipsec_stats_t *s);
+
 #endif /* __DPAA2_IPSEC_H__ */
