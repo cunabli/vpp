@@ -94,11 +94,15 @@ typedef struct
  * one worker's queue-pair for its lifetime: SEC holds the SA's sequence and
  * anti-replay state, so splitting the SA across queue-pairs would corrupt the
  * replay window and reorder within the SA. dev_id == INVALID means this worker
- * has no SEC queue-pair. */
+ * has no SEC queue-pair. cop_pool and inflight are per-worker so both the
+ * enqueue (demux) and dequeue (poll) sides run lock-free: the SPSC pairing of
+ * one worker to one queue-pair. */
 typedef struct
 {
   u16 dev_id;
   u16 qp_id;
+  void *cop_pool; /* crypto-op mempool (opaque rte_mempool*), lazily created */
+  u16 inflight;	  /* ops enqueued to this qp, not yet dequeued back */
 } dpaa2_ipsec_worker_t;
 
 typedef struct
