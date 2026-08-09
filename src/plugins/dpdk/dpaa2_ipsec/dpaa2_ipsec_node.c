@@ -217,15 +217,17 @@ dpaa2_ipsec_offload_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	{
 	  /* One SA is pinned to one worker's queue-pair for its lifetime (D3):
 	   * SEC keeps the SA's sequence/replay state, so every packet must reach
-	   * that worker before enqueue. The first packet claims it via
-	   * cmp-and-swap, mirroring the built-in ESP handoff we displaced. */
+	   * that worker before enqueue. The first packet claims one via
+	   * cmp-and-swap, constrained to the qp-owning workers (so the pinned
+	   * worker can actually enqueue), mirroring the built-in ESP handoff we
+	   * displaced. */
 	  clib_thread_index_t sa_ti;
 	  if (is_decrypt)
 	    {
 	      ipsec_sa_inb_rt_t *rt = ipsec_sa_get_inb_rt_by_index (sa_index);
 	      if (PREDICT_FALSE (rt->thread_index == (clib_thread_index_t) ~0))
 		clib_atomic_cmp_and_swap (&rt->thread_index, ~0,
-					  ipsec_sa_assign_thread (thread_index));
+					  dpaa2_ipsec_assign_offload_thread (thread_index));
 	      sa_ti = rt->thread_index;
 	    }
 	  else
@@ -233,7 +235,7 @@ dpaa2_ipsec_offload_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      ipsec_sa_outb_rt_t *rt = ipsec_sa_get_outb_rt_by_index (sa_index);
 	      if (PREDICT_FALSE (rt->thread_index == (clib_thread_index_t) ~0))
 		clib_atomic_cmp_and_swap (&rt->thread_index, ~0,
-					  ipsec_sa_assign_thread (thread_index));
+					  dpaa2_ipsec_assign_offload_thread (thread_index));
 	      sa_ti = rt->thread_index;
 	    }
 

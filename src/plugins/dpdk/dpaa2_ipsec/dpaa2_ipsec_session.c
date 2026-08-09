@@ -378,11 +378,13 @@ dpaa2_ipsec_check_support (ipsec_sa_t *sa)
   dpaa2_ipsec_main_t *dm = &dpaa2_ipsec_main;
   dpaa2_ipsec_fallback_reason_t reason;
 
-  /* First SA add is a safe point to scan: the cryptodev engine has already
-     configured and started the device by now. */
+  /* First SA add is a safe point to scan and place workers: the cryptodev
+   * engine has configured and started the device by now, claiming its
+   * queue-pairs, so base_qp lands past them. */
   if (!dm->scanned)
     {
       dpaa2_ipsec_scan_devs ();
+      dpaa2_ipsec_place_workers ();
       dm->scanned = 1;
     }
 

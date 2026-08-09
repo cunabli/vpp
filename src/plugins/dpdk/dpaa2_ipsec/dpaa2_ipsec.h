@@ -107,8 +107,12 @@ typedef struct
 
 typedef struct
 {
-  dpaa2_ipsec_dev_t *devs;	    /* per-device capability records */
-  dpaa2_ipsec_worker_t *workers;    /* per-thread SEC placement, by thread */
+  dpaa2_ipsec_dev_t *devs;	 /* per-device capability records */
+  dpaa2_ipsec_worker_t *workers; /* per-thread SEC placement, by thread */
+  /* Thread indices of the workers that own a SEC queue-pair; an offloaded SA
+   * must pin to one of these, keeping thread-assignment in the qp-owning set. */
+  u16 *qp_workers;
+  u32 qp_rr; /* round-robin cursor over qp_workers, for non-qp-local SAs */
   dpaa2_ipsec_sa_route_t *sa_route; /* per-SA routing cache, by sa_index */
   /* Per-SA rte_security sessions, one per direction (SEC sessions are
    * directional; a tunnel-protect SA can be sa-out on one tunnel and sa-in on
@@ -139,6 +143,13 @@ void dpaa2_ipsec_scan_devs (void);
 /* Assign each vlib worker a SEC queue-pair on a SECURITY-capable device and
  * compute each device's base_qp offset past the async engine's claim. */
 void dpaa2_ipsec_place_workers (void);
+
+/* Pick the worker thread an offloaded SA should be pinned to. Prefers the
+ * caller's own thread when it owns a queue-pair (the SA then runs entirely
+ * local, no handoff); otherwise round-robins across the qp-owning workers so an
+ * SA first seen on a non-qp worker still lands on hardware. Returns the caller's
+ * thread unchanged when no worker owns a queue-pair (the SA falls back). */
+u16 dpaa2_ipsec_assign_offload_thread (u32 thread_index);
 
 /* Single source of truth for the per-SA offload decision. Returns nonzero if
  * the SA can be offloaded; on a zero return, *reason says why it falls back.
