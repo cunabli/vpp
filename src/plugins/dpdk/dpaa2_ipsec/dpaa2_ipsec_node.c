@@ -56,6 +56,19 @@ extern vlib_node_registration_t dpaa2_ipsec_poll_node;
  * for the split-phase (enqueued-but-not-dequeued) window. */
 #define DPAA2_IPSEC_N_COPS 2048
 
+/* Max ops we keep outstanding to one SEC queue-pair before dropping early. The
+ * dpaa2_sec qp allocates a frame-list entry (FLE) per in-flight op from a pool
+ * sized to the cryptodev engine's queue depth (CRYPTODEV_NB_CRYPTO_OPS == 1024).
+ * Over-posting past that makes the PMD's build_sec_fd run the FLE pool dry and
+ * hammer a congested QBMAN portal; under a saturating flood that wedges the qp
+ * (enqueue_burst then returns 0 permanently -- see task 3.6). So we self-limit to
+ * a safe fraction of the FLE pool and shed the excess as bounded enqueue-drops
+ * rather than push the portal into that state. The poll node drains fast enough
+ * that a sustainable offer never reaches this ceiling.
+ * ponytail: fixed 512, comfortably under the 1024 FLE pool; a tuning knob for the
+ * 4.1 perf pass, not a constant to trust blindly if the engine's depth changes. */
+#define DPAA2_IPSEC_MAX_INFLIGHT 512
+
 #define foreach_dpaa2_ipsec_next                                              \
   _ (FALLBACK, "fallback") /* set per node to the built-in ESP node */        \
   _ (HANDOFF, "handoff")   /* set per node to the built-in ESP handoff node */ \
@@ -324,8 +337,18 @@ dpaa2_ipsec_offload_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 n_enq = 0;
   if (n_off)
     {
-      n_enq =
-	rte_cryptodev_enqueue_burst (w->dev_id, w->qp_id, ops, (u16) n_off);
+      /* Never post past the qp's safe in-flight ceiling (see MAX_INFLIGHT): the
+       * excess is shed as a bounded drop here rather than handed to the PMD to
+       * fail-and-thrash on a dry FLE pool / congested portal. headroom is what
+       * this qp can still accept before the ceiling. */
+      u32 headroom = (w->inflight < DPAA2_IPSEC_MAX_INFLIGHT)
+		       ? DPAA2_IPSEC_MAX_INFLIGHT - w->inflight
+		       : 0;
+      u32 n_send = n_off < headroom ? n_off : headroom;
+
+      if (n_send)
+	n_enq = rte_cryptodev_enqueue_burst (w->dev_id, w->qp_id, ops,
+					     (u16) n_send);
       w->inflight += n_enq;
 
       /* Charge each enqueued op to its SA's per-direction session so a deferred
@@ -341,15 +364,17 @@ dpaa2_ipsec_offload_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    s->egress_inflight += 1;
 	}
 
-      if (n_enq)
-	/* Wake this worker's poll node to drain what we just queued (D2'
-	 * self-gating: the producer arms the interrupt INPUT consumer). */
+      if (w->inflight)
+	/* Keep this worker's poll node scheduled while SEC holds ANY op, not only
+	 * when we just enqueued: under backpressure (n_send/n_enq can be 0 while
+	 * ops are still draining) the consumer must stay armed or the qp would
+	 * never be drained -- the wedge task 3.6 hunts (D2' self-gating consumer). */
 	vlib_node_set_interrupt_pending (vm, dpaa2_ipsec_poll_node.index);
 
       if (PREDICT_FALSE (n_enq < n_off))
 	{
-	  /* SEC queue-pair full: drop the un-enqueued packets (bounded, no worker
-	   * block, no corruption) and free their ops back to the pool. */
+	  /* Over the ceiling or qp full: drop the un-enqueued packets (bounded, no
+	   * worker block, no corruption) and free their ops back to the pool. */
 	  for (u32 i = n_enq; i < n_off; i++)
 	    {
 	      tg[0] = op_bi[i];
@@ -787,6 +812,22 @@ dpaa2_ipsec_get_stats (dpaa2_ipsec_stats_t *s)
     dpaa2_ipsec_sum_error (vm, poll, DPAA2_IPSEC_POLL_ERROR_AUTH_FAIL);
   s->status_fail =
     dpaa2_ipsec_sum_error (vm, poll, DPAA2_IPSEC_POLL_ERROR_STATUS_FAIL);
+
+  /* PMD-side qp counters, straight from the dpaa2_sec driver (device-wide sum
+   * over its queue-pairs). Localizes an enqueue wedge: if pmd_enq_err climbs and
+   * pmd_deq falls behind pmd_enq while the plugin's own offloaded/dequeued are
+   * balanced, the stall is in the queue-pair/portal, not our accounting. */
+  if (dpaa2_ipsec_main.sec_dev_id != DPAA2_IPSEC_INVALID_U16)
+    {
+      struct rte_cryptodev_stats cs;
+      if (rte_cryptodev_stats_get (dpaa2_ipsec_main.sec_dev_id, &cs) == 0)
+	{
+	  s->pmd_enq = cs.enqueued_count;
+	  s->pmd_enq_err = cs.enqueue_err_count;
+	  s->pmd_deq = cs.dequeued_count;
+	  s->pmd_deq_err = cs.dequeue_err_count;
+	}
+    }
 }
 
 /*
