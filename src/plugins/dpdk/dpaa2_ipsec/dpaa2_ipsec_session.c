@@ -341,10 +341,56 @@ sa_session_cache_set (u32 sa_index, void *egress, void *ingress,
 
   vec_validate (dm->sa_session, sa_index);
   vec_validate (dm->sa_route, sa_index);
-  dm->sa_session[sa_index].egress = egress;
-  dm->sa_session[sa_index].ingress = ingress;
+  /* Fresh slot: new sessions, zero in-flight. A previous tenant's still-draining
+   * sessions live on their owning worker's pending-destroy list, keyed by pointer,
+   * not in this slot -- so reusing the slot here can never disturb them. */
+  dm->sa_session[sa_index] = (dpaa2_ipsec_sa_sess_t){
+    .egress = egress,
+    .ingress = ingress,
+  };
   dm->sa_route[sa_index].decision = decision;
   dm->sa_route[sa_index].reason = reason;
+}
+
+/* Tear down one direction's session on SA delete. If SEC holds no ops for it,
+ * destroy now. Otherwise hand it to its owning worker's pending-destroy list, which
+ * frees it once its own ops drain -- destroying now would rte_free() the flow context
+ * SEC is still reading (a use-after-free). Runs under the worker barrier, so the
+ * inflight snapshot is stable and the append is race-free. */
+static void
+dpaa2_ipsec_defer_or_destroy (u32 sa_index, void *session, int is_ingress,
+			      u32 inflight)
+{
+  dpaa2_ipsec_main_t *dm = &dpaa2_ipsec_main;
+  void *sec_ctx = rte_cryptodev_get_sec_ctx (dm->sec_dev_id);
+
+  if (inflight == 0)
+    {
+      rte_security_session_destroy (sec_ctx, session);
+      return;
+    }
+
+  /* The direction's pinned worker (set on first packet; always valid when
+   * inflight>0) owns the queue-pair these ops complete on, so its poll node is the
+   * one that will retire the session. */
+  clib_thread_index_t ti =
+    is_ingress ? ipsec_sa_get_inb_rt_by_index (sa_index)->thread_index
+	       : ipsec_sa_get_outb_rt_by_index (sa_index)->thread_index;
+  if (ti == (clib_thread_index_t) ~0 || ti >= vec_len (dm->workers))
+    {
+      /* No owning worker to drain it (should not happen with inflight>0). A safe
+       * leak beats a use-after-free: leave the session allocated. */
+      log_notice ("SA %u: %u ops in flight but no owning worker; leaking session",
+		  sa_index, inflight);
+      return;
+    }
+  dpaa2_ipsec_pending_destroy_t p = {
+    .session = session,
+    .remaining = inflight,
+    .is_ingress = (u8) is_ingress,
+  };
+  vec_add1 (dm->workers[ti].pending_destroy, p);
+  dm->sessions_deferred += 1;
 }
 
 /* --- ESP offload provider callbacks --- */
@@ -413,20 +459,30 @@ dpaa2_ipsec_session_add_del (u32 sa_index, int is_add)
 	   !dm->sa_session[sa_index].ingress))
 	return;
 
-      /* ponytail: destroys the sessions synchronously; SEC may still hold
-       * in-flight ops referencing them, a potential PMD use-after-free on
-       * delete-under-traffic. Add a per-worker drain (destroy once inflight
-       * hits zero) after task 3.5 characterises real PMD teardown on hardware. */
-      if (dm->sa_session[sa_index].egress)
-	rte_security_session_destroy (sec_ctx, dm->sa_session[sa_index].egress);
-      if (dm->sa_session[sa_index].ingress)
-	rte_security_session_destroy (sec_ctx,
-				      dm->sa_session[sa_index].ingress);
-      dm->sa_session[sa_index].egress = NULL;
-      dm->sa_session[sa_index].ingress = NULL;
+      /* Destroy each direction now if idle, else defer it to its owning worker's
+       * pending-destroy list (keyed by session pointer). Then CLEAR the slot: the
+       * deferred sessions no longer live here, they live on the worker list, so the
+       * slot is immediately safe to reuse. A straggler for a deferred session is
+       * matched by pointer against that list, never against whatever SA reuses this
+       * slot -- so the reused SA's in-flight counters are never corrupted (no
+       * second-order use-after-free) and the old session is freed exactly when its
+       * last op drains (no leak). */
+      dpaa2_ipsec_sa_sess_t *s = &dm->sa_session[sa_index];
+      u64 deferred = dm->sessions_deferred;
+      if (s->egress)
+	dpaa2_ipsec_defer_or_destroy (sa_index, s->egress, 0, s->egress_inflight);
+      if (s->ingress)
+	dpaa2_ipsec_defer_or_destroy (sa_index, s->ingress, 1, s->ingress_inflight);
+
+      *s = (dpaa2_ipsec_sa_sess_t){ 0 };
       dm->sa_route[sa_index].decision = DPAA2_IPSEC_ROUTE_UNDECIDED;
       dm->sa_route[sa_index].reason = DPAA2_IPSEC_FALLBACK_NONE;
-      log_debug ("SA %u: offload sessions destroyed", sa_index);
+
+      if (dm->sessions_deferred != deferred)
+	log_debug ("SA %u: session teardown deferred until in-flight ops drain",
+		   sa_index);
+      else
+	log_debug ("SA %u: offload sessions destroyed", sa_index);
     }
 }
 

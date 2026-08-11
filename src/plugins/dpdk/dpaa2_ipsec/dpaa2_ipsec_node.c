@@ -179,6 +179,7 @@ dpaa2_ipsec_offload_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   u16 nexts[VLIB_FRAME_SIZE], *nx = nexts;
   struct rte_crypto_op *ops[VLIB_FRAME_SIZE];
   u32 op_bi[VLIB_FRAME_SIZE];
+  u32 op_sad[VLIB_FRAME_SIZE]; /* SA of each built op, for per-session inflight */
   u32 n_off = 0, n_fb = 0, n_cop_fail = 0, n_ho = 0;
 
   int have_qp = w && w->dev_id != DPAA2_IPSEC_INVALID_U16;
@@ -298,6 +299,7 @@ dpaa2_ipsec_offload_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  dpaa2_ipsec_mbuf_sync (vm, b);
 	  ops[n_off] = op;
 	  op_bi[n_off] = bi;
+	  op_sad[n_off] = sa_index;
 	  n_off += 1;
 	}
       else
@@ -325,6 +327,19 @@ dpaa2_ipsec_offload_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       n_enq =
 	rte_cryptodev_enqueue_burst (w->dev_id, w->qp_id, ops, (u16) n_off);
       w->inflight += n_enq;
+
+      /* Charge each enqueued op to its SA's per-direction session so a deferred
+       * teardown knows when SEC no longer references the session (this node's
+       * direction is fixed by is_decrypt). enqueue_burst takes the first n_enq. */
+      for (u32 i = 0; i < n_enq; i++)
+	{
+	  dpaa2_ipsec_sa_sess_t *s =
+	    vec_elt_at_index (dm->sa_session, op_sad[i]);
+	  if (is_decrypt)
+	    s->ingress_inflight += 1;
+	  else
+	    s->egress_inflight += 1;
+	}
 
       if (n_enq)
 	/* Wake this worker's poll node to drain what we just queued (D2'
@@ -517,6 +532,39 @@ dpaa2_ipsec_buffer_resync (vlib_buffer_t *b, struct rte_mbuf *mb)
   b->current_length = mb->data_len;
 }
 
+/* Retire a straggler completion whose SA was deleted (its session was deferred).
+ * The session is found by pointer on this worker's pending-destroy list -- never by
+ * the cache slot, which may already belong to a new SA. Decrements that session's
+ * remaining count and, when it hits zero (SEC no longer references the flow context),
+ * destroys it. Returns the direction (0 egress, 1 ingress) for routing, or -1 if the
+ * session is unknown (already fully drained -- a defensive drop, should not happen). */
+static_always_inline int
+dpaa2_ipsec_pending_retire (dpaa2_ipsec_worker_t *w, void *sess)
+{
+  dpaa2_ipsec_main_t *dm = &dpaa2_ipsec_main;
+
+  for (u32 i = 0; i < vec_len (w->pending_destroy); i++)
+    {
+      dpaa2_ipsec_pending_destroy_t *p =
+	vec_elt_at_index (w->pending_destroy, i);
+      if (p->session != sess)
+	continue;
+
+      int is_ingress = p->is_ingress;
+      if (p->remaining)
+	p->remaining -= 1;
+      if (p->remaining == 0)
+	{
+	  void *sec_ctx = rte_cryptodev_get_sec_ctx (dm->sec_dev_id);
+	  rte_security_session_destroy (sec_ctx, sess);
+	  dm->sessions_drained += 1;
+	  vec_del1 (w->pending_destroy, i); /* order-independent; we return now */
+	}
+      return is_ingress;
+    }
+  return -1;
+}
+
 static_always_inline uword
 dpaa2_ipsec_poll_inline (vlib_main_t *vm, vlib_node_runtime_t *node)
 {
@@ -561,25 +609,48 @@ dpaa2_ipsec_poll_inline (vlib_main_t *vm, vlib_node_runtime_t *node)
 
       dpaa2_ipsec_buffer_resync (b, mb);
 
-      if (PREDICT_FALSE (op->status != RTE_CRYPTO_OP_STATUS_SUCCESS))
+      /* Identify the op by its ATTACHED SESSION (the PMD preserves op->sym->session),
+       * not the SA's IS_INBOUND flag -- a tunnel-protect SA is used both ways under
+       * one sa_index. If the session still matches the cache slot it is a current-SA
+       * op: retire it from that slot's per-direction in-flight count. If it matches
+       * neither, the SA was deleted and its session deferred; find it by pointer on
+       * this worker's pending-destroy list and retire it there. Either way the count
+       * that governs the eventual free follows the SESSION, so a straggler can never
+       * touch a different (reused) SA's slot. */
+      u32 sad = vnet_buffer (b)->ipsec.sad_index;
+      void *sess = op->sym->session;
+      dpaa2_ipsec_sa_sess_t *s =
+	sad < vec_len (dm->sa_session) ? vec_elt_at_index (dm->sa_session, sad) : 0;
+      int is_dec, current = 0;
+
+      if (s && sess == s->ingress)
+	{
+	  is_dec = 1;
+	  current = 1;
+	  if (s->ingress_inflight)
+	    s->ingress_inflight -= 1;
+	}
+      else if (s && sess == s->egress)
+	{
+	  is_dec = 0;
+	  current = 1;
+	  if (s->egress_inflight)
+	    s->egress_inflight -= 1;
+	}
+      else
+	is_dec = dpaa2_ipsec_pending_retire (w, sess);
+
+      if (PREDICT_FALSE (op->status != RTE_CRYPTO_OP_STATUS_SUCCESS ||
+			 is_dec < 0))
 	{
 	  next = DPAA2_IPSEC_POLL_NEXT_DROP;
 	  if (op->status == RTE_CRYPTO_OP_STATUS_AUTH_FAILED)
 	    n_auth_fail += 1;
-	  else
+	  else if (op->status != RTE_CRYPTO_OP_STATUS_SUCCESS)
 	    n_status_fail += 1;
 	}
       else
 	{
-	  /* Direction is carried per-op via the attached session, not the SA's
-	   * IS_INBOUND flag: a tunnel-protect SA is used both ways under one
-	   * sa_index and one flag. The op keeps the session we attached (the PMD
-	   * preserves op->sym->session), so a decap completion is the one holding
-	   * this SA's ingress session. sad_index addresses a stable (never-unmapped)
-	   * pool slot even if the SA was deleted in-flight, so the compare is safe. */
-	  u32 sad = vnet_buffer (b)->ipsec.sad_index;
-	  int is_dec = sad < vec_len (dm->sa_session) &&
-		       op->sym->session == dm->sa_session[sad].ingress;
 	  if (is_dec)
 	    {
 	      /* Tunnel decap: SEC handed us the inner packet; route by its IP
@@ -593,14 +664,16 @@ dpaa2_ipsec_poll_inline (vlib_main_t *vm, vlib_node_runtime_t *node)
 	     * midchain adjacency (still in adj_index[VLIB_TX]) sends it out. */
 	    next = DPAA2_IPSEC_POLL_NEXT_MIDCHAIN_TX;
 
-	  /* Feed the core per-SA counter (the one the built-in ESP nodes feed)
-	   * so an offloaded SA shows packets/bytes in `show ipsec sa` too. On
-	   * completion, successful transforms only, with the on-wire length.
-	   * ponytail: per-packet increment; batch same-SA runs only if the perf
-	   * pass (4.1) shows it matters. */
-	  vlib_increment_combined_counter (&ipsec_sa_counters, thread_index,
-					   vnet_buffer (b)->ipsec.sad_index, 1,
-					   vlib_buffer_length_in_chain (vm, b));
+	  /* Feed the core per-SA counter (the one the built-in ESP nodes feed) so an
+	   * offloaded SA shows packets/bytes in `show ipsec sa` too -- current-SA ops
+	   * only: a straggler's sad_index may now name a different (reused) SA, so
+	   * counting it there would misattribute. Successful transforms only, on-wire
+	   * length. ponytail: per-packet increment; batch same-SA runs only if the
+	   * perf pass (4.1) shows it matters. */
+	  if (current)
+	    vlib_increment_combined_counter (&ipsec_sa_counters, thread_index,
+					     sad, 1,
+					     vlib_buffer_length_in_chain (vm, b));
 	}
 
       bufs[i] = vlib_get_buffer_index (vm, b);
@@ -715,3 +788,74 @@ dpaa2_ipsec_get_stats (dpaa2_ipsec_stats_t *s)
   s->status_fail =
     dpaa2_ipsec_sum_error (vm, poll, DPAA2_IPSEC_POLL_ERROR_STATUS_FAIL);
 }
+
+/*
+ * "test dpaa2-ipsec" - in-process unit test for the deferred-session drain state
+ * machine (ADR 0004). Exercises the real dpaa2_ipsec_pending_retire() against
+ * synthetic pending entries: pointer-keyed matching, per-entry decrement, and
+ * reused-slot isolation (one session's completion never touches another's count).
+ * Board-free by construction -- it never drives an entry's remaining to zero, so
+ * it never reaches the device-coupled rte_security_session_destroy(); that single
+ * line stays covered by the 3.5 board proof. What a future edit could silently
+ * break -- match the wrong entry, decrement the wrong count, retire early -- is
+ * what is asserted here.
+ */
+static clib_error_t *
+dpaa2_ipsec_test_drain (vlib_main_t *vm, unformat_input_t *input,
+			vlib_cli_command_t *cmd)
+{
+  dpaa2_ipsec_worker_t w = { 0 };
+  void *sess_a = (void *) 0x1000, *sess_b = (void *) 0x2000,
+       *sess_unknown = (void *) 0x9999;
+  u64 drained0 = dpaa2_ipsec_main.sessions_drained;
+  u32 fails = 0;
+
+  dpaa2_ipsec_pending_destroy_t pa = { .session = sess_a, .remaining = 2,
+				       .is_ingress = 1 };
+  dpaa2_ipsec_pending_destroy_t pb = { .session = sess_b, .remaining = 2,
+				       .is_ingress = 0 };
+  vec_add1 (w.pending_destroy, pa);
+  vec_add1 (w.pending_destroy, pb);
+
+#define T(cond, msg)                                                          \
+  if (!(cond))                                                                \
+    {                                                                         \
+      vlib_cli_output (vm, "  FAIL: %s", msg);                               \
+      fails++;                                                                \
+    }
+
+  /* Unknown session: no match, returns -1, touches nothing. */
+  T (dpaa2_ipsec_pending_retire (&w, sess_unknown) == -1, "unknown -> -1");
+  T (w.pending_destroy[0].remaining == 2 && w.pending_destroy[1].remaining == 2,
+     "unknown leaves every entry untouched");
+
+  /* Match A: returns A's direction (ingress), decrements A only. */
+  T (dpaa2_ipsec_pending_retire (&w, sess_a) == 1, "match A -> ingress");
+  T (w.pending_destroy[0].remaining == 1, "A's remaining decremented");
+  T (w.pending_destroy[1].remaining == 2, "B isolated from A's completion");
+
+  /* Match B: returns B's direction (egress), decrements B only. */
+  T (dpaa2_ipsec_pending_retire (&w, sess_b) == 0, "match B -> egress");
+  T (w.pending_destroy[1].remaining == 1, "B's remaining decremented");
+  T (w.pending_destroy[0].remaining == 1, "A unchanged by B's completion");
+
+  /* Nothing reached zero, so nothing was retired or drained. */
+  T (vec_len (w.pending_destroy) == 2, "no entry retired before draining");
+  T (dpaa2_ipsec_main.sessions_drained == drained0, "drained counter untouched");
+#undef T
+
+  vec_free (w.pending_destroy);
+
+  if (fails)
+    return clib_error_return (0, "test dpaa2-ipsec: %u check(s) FAILED", fails);
+  vlib_cli_output (vm, "test dpaa2-ipsec drain state machine: PASS "
+		       "(match / decrement / isolation; free-at-zero is the "
+		       "device-coupled line, board-proven -- see ADR 0004)");
+  return 0;
+}
+
+VLIB_CLI_COMMAND (dpaa2_ipsec_test_command, static) = {
+  .path = "test dpaa2-ipsec",
+  .short_help = "test dpaa2-ipsec (deferred-session drain state machine)",
+  .function = dpaa2_ipsec_test_drain,
+};
