@@ -209,6 +209,13 @@ typedef struct
   u64 dequeued;	    /* completions taken back from SEC */
   u64 auth_fail;    /* SEC reported an authentication failure */
   u64 status_fail;  /* SEC reported any other operation failure */
+  /* PMD-side qp counters (rte_cryptodev_stats_get, device-wide). Cross-checked
+   * against the plugin totals to localize an enqueue wedge: pmd_enq_err climbing
+   * while pmd_deq trails pmd_enq points at the queue-pair/portal, not the plugin. */
+  u64 pmd_enq;	    /* FDs the PMD accepted (enqueued_count) */
+  u64 pmd_enq_err;  /* FDs the PMD could not post (enqueue_err_count) */
+  u64 pmd_deq;	    /* completions the PMD returned (dequeued_count) */
+  u64 pmd_deq_err;  /* error completions (dequeue_err_count) */
 } dpaa2_ipsec_stats_t;
 
 /* Sum the demux + poll node counters across all workers into *s. Defined in the
