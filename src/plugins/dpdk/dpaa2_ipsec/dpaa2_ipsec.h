@@ -67,7 +67,31 @@ typedef struct
 {
   void *egress;
   void *ingress;
+  /* Ops enqueued to SEC for each direction's session, not yet completed. The
+   * session's flow context is DMA memory the hardware reads mid-op, so the
+   * session must not be destroyed while its count is nonzero. Single-writer per
+   * counter: a direction's enqueue (demux) and completion (poll) both run on
+   * that direction's pinned worker. On delete this snapshot becomes the deferred
+   * entry's remaining count (see dpaa2_ipsec_pending_destroy_t). */
+  u32 egress_inflight;
+  u32 ingress_inflight;
 } dpaa2_ipsec_sa_sess_t;
+
+/* A session whose SA was deleted while SEC still held ops for it: it is destroyed
+ * only when its own ops drain (remaining hits zero), NOT when the SA's cache slot
+ * empties. Keyed by the session pointer (op->sym->session, which the PMD preserves
+ * on completion), so a straggler is matched here even after its cache slot has been
+ * reused by a new SA -- which is what makes reuse-before-drain safe: the new SA's
+ * in-flight counters are never touched by an old op, and the old session is freed
+ * exactly when the last op referencing it completes (no leak, no use-after-free).
+ * Held on the owning worker's list (the direction's pinned thread), so the poll node
+ * retires it lock-free; the main thread only appends under the worker barrier. */
+typedef struct
+{
+  void *session;   /* rte_security_session* awaiting its ops to drain */
+  u32 remaining;   /* ops still in SEC for this session */
+  u8 is_ingress;   /* direction, for routing its straggler completions */
+} dpaa2_ipsec_pending_destroy_t;
 
 /* Per-device capability record, one per rte_cryptodev. Offload availability is
  * a per-device property (does it advertise the SECURITY feature), not a global
@@ -103,6 +127,10 @@ typedef struct
   u16 qp_id;
   void *cop_pool; /* crypto-op mempool (opaque rte_mempool*), lazily created */
   u16 inflight;	  /* ops enqueued to this qp, not yet dequeued back */
+  /* Sessions of deleted SAs whose ops are still draining on this worker's qp. The
+   * poll node retires each as its stragglers complete; the main thread appends here
+   * under the worker barrier. */
+  dpaa2_ipsec_pending_destroy_t *pending_destroy;
 } dpaa2_ipsec_worker_t;
 
 typedef struct
@@ -130,6 +158,13 @@ typedef struct
   u8 offload_disabled;
   u8 have_security_dev; /* scan found a SECURITY-capable device */
   u8 scanned;		/* one-time lazy device scan + placement done */
+
+  /* Deferred-teardown observability (task 3.5): a session freed while SEC still
+   * held ops for it is deferred, then destroyed by the poll node once its
+   * in-flight drains. Counted so the delete-under-traffic path is visible in
+   * `show ipsec offload` -- deferred should equal drained once traffic quiesces. */
+  u64 sessions_deferred; /* teardowns deferred because ops were in flight */
+  u64 sessions_drained;  /* deferred teardowns the poll node later completed */
 
   vlib_log_class_t log_class;
 } dpaa2_ipsec_main_t;

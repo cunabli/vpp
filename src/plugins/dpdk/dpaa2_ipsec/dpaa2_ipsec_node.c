@@ -179,6 +179,7 @@ dpaa2_ipsec_offload_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   u16 nexts[VLIB_FRAME_SIZE], *nx = nexts;
   struct rte_crypto_op *ops[VLIB_FRAME_SIZE];
   u32 op_bi[VLIB_FRAME_SIZE];
+  u32 op_sad[VLIB_FRAME_SIZE]; /* SA of each built op, for per-session inflight */
   u32 n_off = 0, n_fb = 0, n_cop_fail = 0, n_ho = 0;
 
   int have_qp = w && w->dev_id != DPAA2_IPSEC_INVALID_U16;
@@ -298,6 +299,7 @@ dpaa2_ipsec_offload_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  dpaa2_ipsec_mbuf_sync (vm, b);
 	  ops[n_off] = op;
 	  op_bi[n_off] = bi;
+	  op_sad[n_off] = sa_index;
 	  n_off += 1;
 	}
       else
@@ -325,6 +327,19 @@ dpaa2_ipsec_offload_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       n_enq =
 	rte_cryptodev_enqueue_burst (w->dev_id, w->qp_id, ops, (u16) n_off);
       w->inflight += n_enq;
+
+      /* Charge each enqueued op to its SA's per-direction session so a deferred
+       * teardown knows when SEC no longer references the session (this node's
+       * direction is fixed by is_decrypt). enqueue_burst takes the first n_enq. */
+      for (u32 i = 0; i < n_enq; i++)
+	{
+	  dpaa2_ipsec_sa_sess_t *s =
+	    vec_elt_at_index (dm->sa_session, op_sad[i]);
+	  if (is_decrypt)
+	    s->ingress_inflight += 1;
+	  else
+	    s->egress_inflight += 1;
+	}
 
       if (n_enq)
 	/* Wake this worker's poll node to drain what we just queued (D2'
@@ -517,6 +532,39 @@ dpaa2_ipsec_buffer_resync (vlib_buffer_t *b, struct rte_mbuf *mb)
   b->current_length = mb->data_len;
 }
 
+/* Retire a straggler completion whose SA was deleted (its session was deferred).
+ * The session is found by pointer on this worker's pending-destroy list -- never by
+ * the cache slot, which may already belong to a new SA. Decrements that session's
+ * remaining count and, when it hits zero (SEC no longer references the flow context),
+ * destroys it. Returns the direction (0 egress, 1 ingress) for routing, or -1 if the
+ * session is unknown (already fully drained -- a defensive drop, should not happen). */
+static_always_inline int
+dpaa2_ipsec_pending_retire (dpaa2_ipsec_worker_t *w, void *sess)
+{
+  dpaa2_ipsec_main_t *dm = &dpaa2_ipsec_main;
+
+  for (u32 i = 0; i < vec_len (w->pending_destroy); i++)
+    {
+      dpaa2_ipsec_pending_destroy_t *p =
+	vec_elt_at_index (w->pending_destroy, i);
+      if (p->session != sess)
+	continue;
+
+      int is_ingress = p->is_ingress;
+      if (p->remaining)
+	p->remaining -= 1;
+      if (p->remaining == 0)
+	{
+	  void *sec_ctx = rte_cryptodev_get_sec_ctx (dm->sec_dev_id);
+	  rte_security_session_destroy (sec_ctx, sess);
+	  dm->sessions_drained += 1;
+	  vec_del1 (w->pending_destroy, i); /* order-independent; we return now */
+	}
+      return is_ingress;
+    }
+  return -1;
+}
+
 static_always_inline uword
 dpaa2_ipsec_poll_inline (vlib_main_t *vm, vlib_node_runtime_t *node)
 {
@@ -561,25 +609,48 @@ dpaa2_ipsec_poll_inline (vlib_main_t *vm, vlib_node_runtime_t *node)
 
       dpaa2_ipsec_buffer_resync (b, mb);
 
-      if (PREDICT_FALSE (op->status != RTE_CRYPTO_OP_STATUS_SUCCESS))
+      /* Identify the op by its ATTACHED SESSION (the PMD preserves op->sym->session),
+       * not the SA's IS_INBOUND flag -- a tunnel-protect SA is used both ways under
+       * one sa_index. If the session still matches the cache slot it is a current-SA
+       * op: retire it from that slot's per-direction in-flight count. If it matches
+       * neither, the SA was deleted and its session deferred; find it by pointer on
+       * this worker's pending-destroy list and retire it there. Either way the count
+       * that governs the eventual free follows the SESSION, so a straggler can never
+       * touch a different (reused) SA's slot. */
+      u32 sad = vnet_buffer (b)->ipsec.sad_index;
+      void *sess = op->sym->session;
+      dpaa2_ipsec_sa_sess_t *s =
+	sad < vec_len (dm->sa_session) ? vec_elt_at_index (dm->sa_session, sad) : 0;
+      int is_dec, current = 0;
+
+      if (s && sess == s->ingress)
+	{
+	  is_dec = 1;
+	  current = 1;
+	  if (s->ingress_inflight)
+	    s->ingress_inflight -= 1;
+	}
+      else if (s && sess == s->egress)
+	{
+	  is_dec = 0;
+	  current = 1;
+	  if (s->egress_inflight)
+	    s->egress_inflight -= 1;
+	}
+      else
+	is_dec = dpaa2_ipsec_pending_retire (w, sess);
+
+      if (PREDICT_FALSE (op->status != RTE_CRYPTO_OP_STATUS_SUCCESS ||
+			 is_dec < 0))
 	{
 	  next = DPAA2_IPSEC_POLL_NEXT_DROP;
 	  if (op->status == RTE_CRYPTO_OP_STATUS_AUTH_FAILED)
 	    n_auth_fail += 1;
-	  else
+	  else if (op->status != RTE_CRYPTO_OP_STATUS_SUCCESS)
 	    n_status_fail += 1;
 	}
       else
 	{
-	  /* Direction is carried per-op via the attached session, not the SA's
-	   * IS_INBOUND flag: a tunnel-protect SA is used both ways under one
-	   * sa_index and one flag. The op keeps the session we attached (the PMD
-	   * preserves op->sym->session), so a decap completion is the one holding
-	   * this SA's ingress session. sad_index addresses a stable (never-unmapped)
-	   * pool slot even if the SA was deleted in-flight, so the compare is safe. */
-	  u32 sad = vnet_buffer (b)->ipsec.sad_index;
-	  int is_dec = sad < vec_len (dm->sa_session) &&
-		       op->sym->session == dm->sa_session[sad].ingress;
 	  if (is_dec)
 	    {
 	      /* Tunnel decap: SEC handed us the inner packet; route by its IP
@@ -593,14 +664,16 @@ dpaa2_ipsec_poll_inline (vlib_main_t *vm, vlib_node_runtime_t *node)
 	     * midchain adjacency (still in adj_index[VLIB_TX]) sends it out. */
 	    next = DPAA2_IPSEC_POLL_NEXT_MIDCHAIN_TX;
 
-	  /* Feed the core per-SA counter (the one the built-in ESP nodes feed)
-	   * so an offloaded SA shows packets/bytes in `show ipsec sa` too. On
-	   * completion, successful transforms only, with the on-wire length.
-	   * ponytail: per-packet increment; batch same-SA runs only if the perf
-	   * pass (4.1) shows it matters. */
-	  vlib_increment_combined_counter (&ipsec_sa_counters, thread_index,
-					   vnet_buffer (b)->ipsec.sad_index, 1,
-					   vlib_buffer_length_in_chain (vm, b));
+	  /* Feed the core per-SA counter (the one the built-in ESP nodes feed) so an
+	   * offloaded SA shows packets/bytes in `show ipsec sa` too -- current-SA ops
+	   * only: a straggler's sad_index may now name a different (reused) SA, so
+	   * counting it there would misattribute. Successful transforms only, on-wire
+	   * length. ponytail: per-packet increment; batch same-SA runs only if the
+	   * perf pass (4.1) shows it matters. */
+	  if (current)
+	    vlib_increment_combined_counter (&ipsec_sa_counters, thread_index,
+					     sad, 1,
+					     vlib_buffer_length_in_chain (vm, b));
 	}
 
       bufs[i] = vlib_get_buffer_index (vm, b);

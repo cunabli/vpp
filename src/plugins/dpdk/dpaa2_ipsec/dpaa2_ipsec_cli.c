@@ -78,6 +78,9 @@ dpaa2_ipsec_show_offload (vlib_main_t *vm, unformat_input_t *input,
   vlib_cli_output (vm, "  completions: %llu dequeued, %llu auth-fail, %llu "
 		       "other-fail",
 		   st.dequeued, st.auth_fail, st.status_fail);
+  vlib_cli_output (vm, "  teardowns: %llu deferred, %llu drained "
+		       "(deferred = freed with ops still in flight)",
+		   dm->sessions_deferred, dm->sessions_drained);
 
   if (!dm->scanned)
     {
