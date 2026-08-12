@@ -603,8 +603,23 @@ dpaa2_ipsec_poll_inline (vlib_main_t *vm, vlib_node_runtime_t *node)
     return 0;
 
   struct rte_crypto_op *ops[VLIB_FRAME_SIZE];
-  u16 burst = w->inflight < VLIB_FRAME_SIZE ? w->inflight : VLIB_FRAME_SIZE;
-  u16 n_deq = rte_cryptodev_dequeue_burst (w->dev_id, w->qp_id, ops, burst);
+  /* The DPAA2 DQRR ring hands back at most 32 completions per dequeue call, but
+   * the producer (encrypt/decrypt) enqueues a full 256-vector each iteration. A
+   * single 32-burst per poll drains 8x slower than it fills, so in-flight pegs at
+   * MAX_INFLIGHT and the excess is shed as enqueue-drop -- the completion harvest,
+   * not SEC, caps throughput. Drain in a loop up to a full frame so the consumer
+   * keeps pace and SEC's real rate sets the ceiling. Bounded by w->inflight (never
+   * more than are outstanding) and by VLIB_FRAME_SIZE (the buffers[] arrays). */
+  u16 want = w->inflight < VLIB_FRAME_SIZE ? w->inflight : VLIB_FRAME_SIZE;
+  u16 n_deq = 0;
+  while (n_deq < want)
+    {
+      u16 got = rte_cryptodev_dequeue_burst (w->dev_id, w->qp_id, ops + n_deq,
+					     want - n_deq);
+      if (got == 0)
+	break;
+      n_deq += got;
+    }
 
   if (n_deq == 0)
     {
