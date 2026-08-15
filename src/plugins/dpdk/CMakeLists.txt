@@ -140,6 +140,7 @@ add_vpp_plugin(dpdk
   device/init.c
   device/node.c
   ${DPDK_CRYPTODEV_SOURCE}
+  dpaa2/config/config.c
 
   MULTIARCH_SOURCES
   buffer.c

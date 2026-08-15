@@ -39,6 +39,10 @@
 dpdk_main_t dpdk_main;
 dpdk_config_main_t dpdk_config_main;
 
+/* set once rte_eal_init has run; earlier-pass config handlers use it as an
+   ordering tripwire (see dpdk_config) */
+u8 dpdk_eal_initialized;
+
 #define LINK_STATE_ELOGS	0
 
 /* dev_info.speed_capa -> interface name mapppings */
@@ -1558,6 +1562,10 @@ dpdk_config (vlib_main_t * vm, unformat_input_t * input)
 		      (char **) conf->eal_init_args);
   if (ret < 0)
     return clib_error_return (0, "rte_eal_init failed: %U", format_dpdk_rte_err, rte_errno);
+  /* Ordering tripwire for config that must land before EAL init (e.g. the
+     dpaa2 { dprc } binding, which the fslmc bus reads via getenv during
+     rte_eal_init): such handlers error if this is already set. */
+  dpdk_eal_initialized = 1;
 
   /* enable the AVX-512 vPMDs in DPDK */
   if (clib_cpu_supports_avx512_bitalg () &&

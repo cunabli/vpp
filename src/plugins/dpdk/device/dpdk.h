@@ -314,6 +314,9 @@ typedef struct
 
 extern dpdk_config_main_t dpdk_config_main;
 
+/* set once rte_eal_init has run (ordering tripwire for early config) */
+extern u8 dpdk_eal_initialized;
+
 #define DPDK_RX_BURST_SZ VLIB_FRAME_SIZE
 
 typedef struct
