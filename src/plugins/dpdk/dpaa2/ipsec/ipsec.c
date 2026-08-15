@@ -28,6 +28,14 @@
 
 dpaa2_ipsec_main_t dpaa2_ipsec_main;
 
+/* The demux nodes (defined in the node file). Their indices are handed to the
+ * core at provider registration; the core repoints its ESP tunnel node indices
+ * at them so tunnel traffic enters here. */
+extern vlib_node_registration_t dpaa2_esp4_encrypt_tun_node;
+extern vlib_node_registration_t dpaa2_esp6_encrypt_tun_node;
+extern vlib_node_registration_t dpaa2_esp4_decrypt_tun_node;
+extern vlib_node_registration_t dpaa2_esp6_decrypt_tun_node;
+
 VLIB_REGISTER_LOG_CLASS (dpaa2_ipsec_log, static) = {
   .class_name = "dpdk",
   .subclass_name = "dpaa2-ipsec",
@@ -159,10 +167,35 @@ dpaa2_ipsec_assign_offload_thread (u32 thread_index)
   return dm->qp_workers[i];
 }
 
+/* Register as the core's ESP offload provider: session-lifecycle callbacks
+ * plus our four demux node indices. The core owns the node substitution --
+ * tunnel node indices, tun-input nexts and handoff frame queues -- applies it
+ * at main-loop enter (so init ordering does not matter) and restores the
+ * built-ins on unregister; this plugin never writes ipsec_main. Owning the
+ * demux is capability-independent: with no SECURITY device every SA simply
+ * routes straight through to the built-in fallback node. The device scan,
+ * worker placement and session pool are done lazily on first SA add, when the
+ * cryptodev engine has already brought the device up. */
 static clib_error_t *
 dpaa2_ipsec_init (vlib_main_t *vm)
 {
-  dpaa2_ipsec_main.log_class = dpaa2_ipsec_log.class;
+  dpaa2_ipsec_main_t *dm = &dpaa2_ipsec_main;
+  ipsec_esp_offload_provider_t provider = {
+    .name = "dpaa2-sec",
+    .check_support = dpaa2_ipsec_check_support,
+    .session_add_del = dpaa2_ipsec_session_add_del,
+    .esp4_encrypt_tun_node_index = dpaa2_esp4_encrypt_tun_node.index,
+    .esp6_encrypt_tun_node_index = dpaa2_esp6_encrypt_tun_node.index,
+    .esp4_decrypt_tun_node_index = dpaa2_esp4_decrypt_tun_node.index,
+    .esp6_decrypt_tun_node_index = dpaa2_esp6_decrypt_tun_node.index,
+  };
+
+  dm->log_class = dpaa2_ipsec_log.class;
+
+  if (ipsec_register_esp_offload_provider (vm, &provider))
+    return clib_error_return (
+      0, "dpaa2-sec: ESP offload provider registration refused");
+
   return 0;
 }
 
