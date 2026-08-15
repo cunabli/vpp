@@ -88,6 +88,156 @@ ipsec_add_node (vlib_main_t * vm, const char *node_name,
   *out_next_index = vlib_node_add_next (vm, prev_node->index, node->index);
 }
 
+/*
+ * ESP offload provider: node substitution, applied and restored by the core
+ * (see the registration API in ipsec.h). The saved built-in indices live here
+ * so nothing outside this file ever writes the tunnel node/next/frame-queue
+ * fields of ipsec_main.
+ */
+static struct
+{
+  u32 esp4_enc_node, esp6_enc_node, esp4_dec_node, esp6_dec_node;
+  u32 esp4_dec_next, esp6_dec_next;
+  u32 esp4_enc_fq, esp6_enc_fq, esp4_dec_fq, esp6_dec_fq;
+} esp_offload_builtin;
+static u8 esp_offload_applied;
+static u8 ipsec_main_loop_entered;
+
+static void
+ipsec_esp_offload_apply (vlib_main_t *vm)
+{
+  ipsec_main_t *im = &ipsec_main;
+  ipsec_esp_offload_provider_t *p = &im->esp_offload_provider;
+  u32 ip4_tun_in, ip6_tun_in;
+
+  /* Substitution is optional: a lifecycle-only provider leaves the node
+     indices unset (0 from a zero-initialized struct, or ~0). */
+  if (esp_offload_applied ||
+      p->esp4_encrypt_tun_node_index == 0 ||
+      p->esp4_encrypt_tun_node_index == ~0 ||
+      p->esp6_encrypt_tun_node_index == 0 ||
+      p->esp6_encrypt_tun_node_index == ~0 ||
+      p->esp4_decrypt_tun_node_index == 0 ||
+      p->esp4_decrypt_tun_node_index == ~0 ||
+      p->esp6_decrypt_tun_node_index == 0 ||
+      p->esp6_decrypt_tun_node_index == ~0)
+    return;
+
+  esp_offload_builtin.esp4_enc_node = im->esp4_encrypt_tun_node_index;
+  esp_offload_builtin.esp6_enc_node = im->esp6_encrypt_tun_node_index;
+  esp_offload_builtin.esp4_dec_node = im->esp4_decrypt_tun_node_index;
+  esp_offload_builtin.esp6_dec_node = im->esp6_decrypt_tun_node_index;
+  esp_offload_builtin.esp4_dec_next = im->esp4_decrypt_tun_next_index;
+  esp_offload_builtin.esp6_dec_next = im->esp6_decrypt_tun_next_index;
+  esp_offload_builtin.esp4_enc_fq = im->esp4_enc_tun_fq_index;
+  esp_offload_builtin.esp6_enc_fq = im->esp6_enc_tun_fq_index;
+  esp_offload_builtin.esp4_dec_fq = im->esp4_dec_tun_fq_index;
+  esp_offload_builtin.esp6_dec_fq = im->esp6_dec_tun_fq_index;
+
+  /* Encrypt is reached by node index only (output feature arc end node and
+     the tunnel midchain); decrypt additionally by the tun-input nodes' next.
+     The handoff frame queues are rebound so an SA's worker handoff re-enters
+     the provider's demux on the pinned worker, not the built-in node.
+     esp_mpls_encrypt_tun_node_index is deliberately untouched. */
+  im->esp4_encrypt_tun_node_index = p->esp4_encrypt_tun_node_index;
+  im->esp6_encrypt_tun_node_index = p->esp6_encrypt_tun_node_index;
+  im->esp4_decrypt_tun_node_index = p->esp4_decrypt_tun_node_index;
+  im->esp6_decrypt_tun_node_index = p->esp6_decrypt_tun_node_index;
+
+  ip4_tun_in = vlib_get_node_by_name (vm, (u8 *) "ipsec4-tun-input")->index;
+  ip6_tun_in = vlib_get_node_by_name (vm, (u8 *) "ipsec6-tun-input")->index;
+  im->esp4_decrypt_tun_next_index =
+    vlib_node_add_next (vm, ip4_tun_in, p->esp4_decrypt_tun_node_index);
+  im->esp6_decrypt_tun_next_index =
+    vlib_node_add_next (vm, ip6_tun_in, p->esp6_decrypt_tun_node_index);
+
+  im->esp4_enc_tun_fq_index = vlib_frame_queue_main_init (
+    p->esp4_encrypt_tun_node_index, im->handoff_queue_size);
+  im->esp6_enc_tun_fq_index = vlib_frame_queue_main_init (
+    p->esp6_encrypt_tun_node_index, im->handoff_queue_size);
+  im->esp4_dec_tun_fq_index = vlib_frame_queue_main_init (
+    p->esp4_decrypt_tun_node_index, im->handoff_queue_size);
+  im->esp6_dec_tun_fq_index = vlib_frame_queue_main_init (
+    p->esp6_decrypt_tun_node_index, im->handoff_queue_size);
+
+  esp_offload_applied = 1;
+}
+
+static void
+ipsec_esp_offload_restore (vlib_main_t *vm)
+{
+  ipsec_main_t *im = &ipsec_main;
+
+  if (!esp_offload_applied)
+    return;
+
+  im->esp4_encrypt_tun_node_index = esp_offload_builtin.esp4_enc_node;
+  im->esp6_encrypt_tun_node_index = esp_offload_builtin.esp6_enc_node;
+  im->esp4_decrypt_tun_node_index = esp_offload_builtin.esp4_dec_node;
+  im->esp6_decrypt_tun_node_index = esp_offload_builtin.esp6_dec_node;
+  im->esp4_decrypt_tun_next_index = esp_offload_builtin.esp4_dec_next;
+  im->esp6_decrypt_tun_next_index = esp_offload_builtin.esp6_dec_next;
+  im->esp4_enc_tun_fq_index = esp_offload_builtin.esp4_enc_fq;
+  im->esp6_enc_tun_fq_index = esp_offload_builtin.esp6_enc_fq;
+  im->esp4_dec_tun_fq_index = esp_offload_builtin.esp4_dec_fq;
+  im->esp6_dec_tun_fq_index = esp_offload_builtin.esp6_dec_fq;
+
+  esp_offload_applied = 0;
+}
+
+int
+ipsec_register_esp_offload_provider (
+  vlib_main_t *vm, const ipsec_esp_offload_provider_t *provider)
+{
+  ipsec_main_t *im = &ipsec_main;
+
+  if (im->esp_offload_provider_registered)
+    return -1;
+  /* Tunnel protection snapshots the tunnel node indices into adjacencies;
+     substitution after the first protect would not reach tunnels already
+     wired, so refuse to register into that state. */
+  if (pool_elts (ipsec_tun_protect_pool))
+    return -2;
+
+  im->esp_offload_provider = *provider;
+  im->esp_offload_provider_registered = 1;
+  /* An init-time registration defers node substitution to main-loop enter:
+     the built-in indices being saved are themselves set by init functions
+     whose order relative to the registrant is unspecified. */
+  if (ipsec_main_loop_entered)
+    ipsec_esp_offload_apply (vm);
+  return 0;
+}
+
+int
+ipsec_unregister_esp_offload_provider (vlib_main_t *vm)
+{
+  ipsec_main_t *im = &ipsec_main;
+
+  if (!im->esp_offload_provider_registered)
+    return -1;
+  /* An owned SA's delete must reach the provider that holds its session. */
+  if (!clib_bitmap_is_zero (im->esp_offload_sa_owned))
+    return -2;
+
+  ipsec_esp_offload_restore (vm);
+  clib_memset (&im->esp_offload_provider, 0,
+	       sizeof (im->esp_offload_provider));
+  im->esp_offload_provider_registered = 0;
+  return 0;
+}
+
+static clib_error_t *
+ipsec_esp_offload_main_loop_enter (vlib_main_t *vm)
+{
+  ipsec_main_loop_entered = 1;
+  if (ipsec_main.esp_offload_provider_registered)
+    ipsec_esp_offload_apply (vm);
+  return 0;
+}
+
+VLIB_MAIN_LOOP_ENTER_FUNCTION (ipsec_esp_offload_main_loop_enter);
+
 static inline uword
 ipsec_udp_registration_key (u16 port, u8 is_ip4)
 {

@@ -367,6 +367,134 @@ VLIB_CLI_COMMAND (test_ipsec_spd_perf_command, static) = {
   .function = test_ipsec_spd_outbound_perf_command_fn,
 };
 
+/*
+ * "test esp-offload-provider" - unit test for the single-slot ESP offload
+ * provider registry: second-registrant rejection, per-SA ownership (delete
+ * notifies only the provider that accepted the SA), and unregister blocked
+ * while SAs are owned.  Device-free: the provider is lifecycle-only (no node
+ * substitution) and the SAs are ordinary software SAs.  A real provider may
+ * already hold the slot (a plugin registers at init); the test vacates it
+ * and restores it on the way out.
+ */
+static u32 op_add_calls, op_del_calls, op_last_sa;
+static int op_accept;
+
+static int
+op_check_support (ipsec_sa_t *sa)
+{
+  return op_accept;
+}
+
+static void
+op_session_add_del (u32 sa_index, int is_add)
+{
+  if (is_add)
+    op_add_calls++;
+  else
+    op_del_calls++;
+  op_last_sa = sa_index;
+}
+
+static clib_error_t *
+test_ipsec_offload_provider_fn (vlib_main_t *vm, unformat_input_t *input,
+				vlib_cli_command_t *cmd)
+{
+  ipsec_esp_offload_provider_t prov = {
+    .name = "test-provider",
+    .check_support = op_check_support,
+    .session_add_del = op_session_add_del,
+    /* lifecycle-only: node indices left unset, no graph substitution */
+  };
+  ipsec_main_t *im = &ipsec_main;
+  ipsec_esp_offload_provider_t incumbent = { 0 };
+  int had_incumbent = im->esp_offload_provider_registered;
+  ipsec_key_t ck = { 0 };
+  u8 key_data[] = { 31, 32, 33, 34, 35, 36, 37, 38,
+		    39, 30, 31, 32, 33, 34, 35, 36 };
+  ipsec_key_t ik = { 0 };
+  tunnel_t tun = {};
+  u32 sa_id_a = 770001, sa_id_b = 770002, sai_a, sai_b;
+  clib_error_t *err = 0;
+  int rv;
+
+#define OP_CHECK(cond, msg)                                                   \
+  if (!(cond))                                                                \
+    {                                                                         \
+      err = clib_error_return (0, "FAIL: " msg);                              \
+      goto done;                                                              \
+    }                                                                         \
+  vlib_cli_output (vm, "PASS: " msg);
+
+  ipsec_mk_key (&ck, key_data, 16);
+  op_add_calls = op_del_calls = 0;
+  op_last_sa = ~0;
+
+  if (had_incumbent)
+    {
+      incumbent = im->esp_offload_provider;
+      rv = ipsec_unregister_esp_offload_provider (vm);
+      OP_CHECK (rv == 0, "incumbent provider vacates the slot for the test");
+    }
+
+  rv = ipsec_register_esp_offload_provider (vm, &prov);
+  OP_CHECK (rv == 0, "provider registers into the empty slot");
+  rv = ipsec_register_esp_offload_provider (vm, &prov);
+  OP_CHECK (rv == -1, "second registrant is rejected");
+
+  /* SA the provider accepts -> owned, add callback fires. */
+  op_accept = 1;
+  rv = ipsec_sa_add_and_lock (sa_id_a, 770001, IPSEC_PROTOCOL_ESP,
+			      IPSEC_CRYPTO_ALG_AES_GCM_128, &ck,
+			      IPSEC_INTEG_ALG_NONE, &ik, IPSEC_SA_FLAG_NONE,
+			      1234, IPSEC_UDP_PORT_NONE, IPSEC_UDP_PORT_NONE,
+			      0, &tun, &sai_a);
+  OP_CHECK (rv == 0, "accepted SA created");
+  OP_CHECK (op_add_calls == 1 && op_last_sa == sai_a,
+	    "accepted SA fired the add callback");
+
+  /* SA the provider declines -> not owned, no callback. */
+  op_accept = 0;
+  rv = ipsec_sa_add_and_lock (sa_id_b, 770002, IPSEC_PROTOCOL_ESP,
+			      IPSEC_CRYPTO_ALG_AES_GCM_128, &ck,
+			      IPSEC_INTEG_ALG_NONE, &ik, IPSEC_SA_FLAG_NONE,
+			      1234, IPSEC_UDP_PORT_NONE, IPSEC_UDP_PORT_NONE,
+			      0, &tun, &sai_b);
+  OP_CHECK (rv == 0, "declined SA created");
+  OP_CHECK (op_add_calls == 1, "declined SA fired no add callback");
+
+  /* Unregister is refused while an SA is owned. */
+  rv = ipsec_unregister_esp_offload_provider (vm);
+  OP_CHECK (rv == -2, "unregister refused while an SA is owned");
+
+  /* Deleting the declined SA notifies nobody; deleting the owned one does. */
+  ipsec_sa_unlock_id (sa_id_b);
+  OP_CHECK (op_del_calls == 0, "declined SA's delete fired no callback");
+  ipsec_sa_unlock_id (sa_id_a);
+  OP_CHECK (op_del_calls == 1 && op_last_sa == sai_a,
+	    "owned SA's delete notified only its owner");
+
+  rv = ipsec_unregister_esp_offload_provider (vm);
+  OP_CHECK (rv == 0, "unregister succeeds once nothing is owned");
+  rv = ipsec_unregister_esp_offload_provider (vm);
+  OP_CHECK (rv == -1, "unregister of an empty slot is rejected");
+#undef OP_CHECK
+
+  vlib_cli_output (vm, "ipsec offload-provider unit test passed");
+
+done:
+  if (had_incumbent && !im->esp_offload_provider_registered)
+    ipsec_register_esp_offload_provider (vm, &incumbent);
+  return err;
+}
+
+/* Not nested under `test ipsec`: that terminal command consumes its whole
+ * input line, shadowing sub-paths. */
+VLIB_CLI_COMMAND (test_ipsec_offload_provider_command, static) = {
+  .path = "test esp-offload-provider",
+  .short_help = "internal ESP offload provider registry unit test",
+  .function = test_ipsec_offload_provider_fn,
+};
+
 VLIB_CLI_COMMAND (test_ipsec_command, static) = {
   .path = "test ipsec",
   .short_help = "test ipsec sa <ID> seq-num <VALUE>",

@@ -456,6 +456,8 @@ ipsec_sa_get_crypto_integ_map (ipsec_crypto_alg_t crypto_alg, ipsec_integ_alg_t 
 }
 
 static void ipsec_sa_del (ipsec_sa_t *sa);
+static void ipsec_esp_offload_provider_notify (ipsec_sa_t *sa, u32 sa_index,
+					       int is_add);
 
 static_always_inline u8
 ipsec_sa_outer_ip_protocol (const ipsec_sa_t *sa)
@@ -1062,6 +1064,10 @@ ipsec_sa_add_and_lock (u32 id, u32 spi, ipsec_protocol_t proto,
 
   ipsec_sa_init_runtime (sa, m);
 
+  /* Offer the fully-built SA to any ESP offload provider (e.g. a hardware
+     plugin) so it can create its offload session. */
+  ipsec_esp_offload_provider_notify (sa, sa_index, 1 /* is_add */);
+
   return (0);
 }
 
@@ -1077,6 +1083,10 @@ ipsec_sa_del (ipsec_sa_t * sa)
   sa_index = sa - im->sa_pool;
   hash_unset (im->sa_index_by_sa_id, sa->id);
   tunnel_unresolve (&sa->tunnel);
+
+  /* Tear down any provider offload session before the SA's crypto and runtime
+     state goes away, so the session never outlives the SA. */
+  ipsec_esp_offload_provider_notify (sa, sa_index, 0 /* is_add */);
 
   if (sa->ctx)
     vnet_crypto_ctx_destroy (vm, sa->ctx);
@@ -1095,6 +1105,37 @@ ipsec_sa_del (ipsec_sa_t * sa)
   im->outb_sa_runtimes[sa_index] = 0;
 
   pool_put (im->sa_pool, sa);
+}
+
+static void
+ipsec_esp_offload_provider_notify (ipsec_sa_t *sa, u32 sa_index, int is_add)
+{
+  ipsec_main_t *im = &ipsec_main;
+  ipsec_esp_offload_provider_t *p = &im->esp_offload_provider;
+
+  if (!im->esp_offload_provider_registered)
+    return;
+
+  if (is_add)
+    {
+      /* Offer the SA only if the provider says it can offload it; record the
+	 acceptance so this SA's delete notifies the owner and nobody else. */
+      if (p->check_support && !p->check_support (sa))
+	return;
+      im->esp_offload_sa_owned =
+	clib_bitmap_set (im->esp_offload_sa_owned, sa_index, 1);
+      if (p->session_add_del)
+	p->session_add_del (sa_index, 1);
+    }
+  else
+    {
+      if (!clib_bitmap_get (im->esp_offload_sa_owned, sa_index))
+	return;
+      im->esp_offload_sa_owned =
+	clib_bitmap_set (im->esp_offload_sa_owned, sa_index, 0);
+      if (p->session_add_del)
+	p->session_add_del (sa_index, 0);
+    }
 }
 
 int

@@ -24,6 +24,64 @@
 #define IPSEC_FP_IP4_HASHES_POOL_SIZE 128
 #define IPSEC_FP_IP6_HASHES_POOL_SIZE 128
 
+/*
+ * ESP protocol-offload provider registration.
+ *
+ * A provider is a component (e.g. a hardware plugin) that can perform the whole
+ * ESP transform for an SA -- encap/decap, crypto, IV and sequence bookkeeping,
+ * anti-replay -- rather than just the crypto primitive. IPsec forwarding stays
+ * in the graph; a provider steers the SAs it owns to its own path.
+ *
+ * The crypto-engine seam only delegates crypto operations, and a graph node is
+ * invoked per packet, never on SA delete -- so neither can give a provider the
+ * per-SA lifecycle signal it needs to create and, above all, destroy its
+ * offload session exactly when the SA appears and disappears. This registry is
+ * that signal: on SA add the core offers the SA to the provider (check_support
+ * gates it) so it may create its session; on delete of an SA the provider
+ * accepted, the core notifies it -- and only it -- so the session is torn down.
+ * Without it an offload session would outlive its SA and leak.
+ *
+ * One slot: a second registration is refused. The provider optionally carries
+ * its own ESP tunnel demux nodes; the core applies the node substitution
+ * (tunnel node indices, tun-input nexts, handoff frame queues) and restores
+ * the built-ins on unregister -- a provider never writes ipsec_main itself.
+ * MPLS-over-IPsec is not substituted and always uses the built-in path.
+ */
+typedef int (*ipsec_esp_offload_check_support_fn) (ipsec_sa_t *sa);
+typedef void (*ipsec_esp_offload_session_fn) (u32 sa_index, int is_add);
+
+typedef struct
+{
+  char *name;
+  /* Return nonzero if this provider can offload the given SA. May be NULL,
+     meaning "every SA is accepted". */
+  ipsec_esp_offload_check_support_fn check_support;
+  /* Per-SA lifecycle: is_add=1 on SA create (after check_support accepted);
+     is_add=0 on delete of an SA this provider accepted. Never broadcast --
+     only the accepting provider is notified. */
+  ipsec_esp_offload_session_fn session_add_del;
+  /* Optional ESP tunnel demux nodes: all four set, or none (0 from a
+     zero-initialized struct, or ~0, both mean unset). When set, the core
+     substitutes them for the built-in tunnel nodes -- deferred to main-loop
+     enter for an init-time registration, so the built-in indices being
+     replaced are final regardless of init ordering. */
+  u32 esp4_encrypt_tun_node_index;
+  u32 esp6_encrypt_tun_node_index;
+  u32 esp4_decrypt_tun_node_index;
+  u32 esp6_decrypt_tun_node_index;
+} ipsec_esp_offload_provider_t;
+
+/* Register the ESP offload provider (single slot). Returns 0 on success,
+   -1 if a provider is already registered, -2 if tunnel protection already
+   exists (node indices are snapshotted into adjacencies at tunnel-protect
+   time, so substitution must precede the first protect). */
+int ipsec_register_esp_offload_provider (
+  vlib_main_t *vm, const ipsec_esp_offload_provider_t *provider);
+
+/* Unregister the provider, restoring the built-in tunnel nodes. Returns 0 on
+   success, -1 if none is registered, -2 while the provider still owns SAs. */
+int ipsec_unregister_esp_offload_provider (vlib_main_t *vm);
+
 typedef struct
 {
   u64 key[2];
@@ -181,6 +239,14 @@ typedef struct
   ipsec_sa_t *sa_pool;
   ipsec_sa_inb_rt_t **inb_sa_runtimes;
   ipsec_sa_outb_rt_t **outb_sa_runtimes;
+
+  /* The registered ESP protocol-offload provider, single slot (see the
+     registration API above). */
+  ipsec_esp_offload_provider_t esp_offload_provider;
+  u8 esp_offload_provider_registered;
+  /* Per-sa_index: the provider accepted this SA. Only an owned SA's delete
+     notifies the provider. */
+  clib_bitmap_t *esp_offload_sa_owned;
 } ipsec_main_t;
 
 typedef enum ipsec_format_flags_t_
