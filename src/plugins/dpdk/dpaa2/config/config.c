@@ -2,20 +2,22 @@
  * Copyright (c) 2026 Carlos Aguado.
  *
  * The `dpaa2 {}` startup.conf block: DPAA2-wide configuration, consolidated in
- * one place. Today it carries the container binding (`dprc`); future
- * DPAA2-wide knobs attach here rather than arriving as scattered top-level
- * stanzas.
+ * one place. Today it carries the container binding (`dprc`) and the SEC ESP
+ * offload lever (`ipsec { no-esp-offload }`); future DPAA2-wide knobs attach
+ * here rather than arriving as scattered top-level stanzas.
  *
  * This is deliberately DPDK-header-free -- it only touches vlib's config/parse
- * machinery. It compiles into the dpdk plugin (dpdk_plugin.so) alongside the
- * fslmc bus and rte_eal_init, so setting DPRC here feeds the same binary that
- * consumes it; there is no cross-plugin reach. When the dpaa2 code is
- * eventually split into its own plugin, this file moves with it and takes a
- * dependency on the (patched) dpdk plugin.
+ * machinery and the plugin's own `dpaa2_ipsec_main`. It compiles into the dpdk
+ * plugin (dpdk_plugin.so) alongside the fslmc bus and rte_eal_init, so setting
+ * DPRC here feeds the same binary that consumes it; there is no cross-plugin
+ * reach. When the dpaa2 code is eventually split into its own plugin, this file
+ * moves with it and takes a dependency on the (patched) dpdk plugin.
  */
 
 #include <stdlib.h> /* setenv, for the `dprc` container binding */
 #include <vlib/vlib.h>
+
+#include <dpdk/dpaa2/ipsec/ipsec.h> /* dpaa2_ipsec_main.offload_disabled */
 
 /* Ordering tripwire owned by the dpdk init path (same plugin; declared here to
  * keep this file DPDK-header-free): set once rte_eal_init has run. The `dprc`
@@ -23,10 +25,31 @@
  * rte_eal_init -- so the handler errors if it runs too late. */
 extern u8 dpdk_eal_initialized;
 
+/* Parse the nested `ipsec { … }` sub-block of the top-level `dpaa2 {}` block. */
+static clib_error_t *
+dpaa2_ipsec_sub_config (unformat_input_t *input)
+{
+  dpaa2_ipsec_main_t *dm = &dpaa2_ipsec_main;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      /* Global lever: turn SEC ESP offload off entirely (all SAs then use the
+       * async fallback). Absent, offload is enabled (capability-only). */
+      if (unformat (input, "no-esp-offload"))
+	dm->offload_disabled = 1;
+      else
+	return clib_error_return (0, "unknown ipsec input `%U'",
+				  format_unformat_error, input);
+    }
+
+  return 0;
+}
+
 /* Top-level `dpaa2 {}` startup block.
  *
  *   dpaa2 {
- *     dprc dprc.N   # bind the container in-file (replaces env DPRC=)
+ *     dprc dprc.N              # bind the container in-file (replaces env DPRC=)
+ *     ipsec { no-esp-offload } # SEC ESP offload off; every SA uses async fallback
  *   }
  *
  * This is an EARLY config function on purpose. rte_eal_init runs in the dpdk
@@ -44,6 +67,7 @@ dpaa2_config (vlib_main_t *vm, unformat_input_t *input)
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
+      unformat_input_t sub_input;
       u8 *name = 0;
 
       /* Bind the container in-file. overwrite=1 makes an explicit `dprc` win
@@ -73,6 +97,14 @@ dpaa2_config (vlib_main_t *vm, unformat_input_t *input)
 	    }
 	  setenv ("DPRC", (char *) name, 1);
 	  dprc_bound = name;
+	}
+      else if (unformat (input, "ipsec %U", unformat_vlib_cli_sub_input,
+			 &sub_input))
+	{
+	  error = dpaa2_ipsec_sub_config (&sub_input);
+	  unformat_free (&sub_input);
+	  if (error)
+	    break;
 	}
       else
 	{

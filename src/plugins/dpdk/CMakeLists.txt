@@ -141,6 +141,7 @@ add_vpp_plugin(dpdk
   device/node.c
   ${DPDK_CRYPTODEV_SOURCE}
   dpaa2/config/config.c
+  dpaa2/ipsec/ipsec.c
 
   MULTIARCH_SOURCES
   buffer.c
@@ -161,4 +162,10 @@ add_vpp_plugin(dpdk
 
   COMPONENT
   vpp-plugin-dpdk
+)
+
+# Host unit test for the pure SA routing predicate (no VPP/DPDK link needed;
+# the decision core is freestanding).
+add_vpp_test(test_dpaa2_ipsec_gate
+  SOURCES dpaa2/ipsec/test_gate.c
 )
