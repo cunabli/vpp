@@ -84,6 +84,21 @@ dpdk_hw_buffer_pool_init (vlib_main_t *vm, vlib_buffer_pool_t *bp,
   u32 elt_size =
     sizeof (struct rte_mbuf) + sizeof (vlib_buffer_t) + bp->data_size;
 
+  /* This path hands DPDK-laid-out mempool objects to vlib by index, so the two
+     must agree on object placement: vlib indexes CLIB_CACHE_LINE_BYTES
+     multiples, DPDK aligns objects to RTE_CACHE_LINE_SIZE.  It cannot be a
+     STATIC_ASSERT -- the software path lays buffers out at VPP's own alignment
+     and is unaffected, so a mismatched build is only invalid once a
+     hardware-backed pool is actually requested. */
+  if (CLIB_CACHE_LINE_BYTES != RTE_CACHE_LINE_SIZE)
+    return clib_error_return (
+      0,
+      "HW buffer pool %u: VPP cache line is %u bytes but DPDK's is %u; "
+      "mempool objects would not land on the vlib buffer index grid.  "
+      "Rebuild VPP with -DVPP_CACHE_LINE_SIZE=%u",
+      bp->index, (u32) CLIB_CACHE_LINE_BYTES, (u32) RTE_CACHE_LINE_SIZE,
+      (u32) RTE_CACHE_LINE_SIZE);
+
   vec_validate_aligned (dpdk_mempool_by_buffer_pool_index, bp->index,
 			CLIB_CACHE_LINE_BYTES);
   vec_validate_aligned (dpdk_no_cache_mempool_by_buffer_pool_index, bp->index,
@@ -160,13 +175,29 @@ dpdk_hw_buffer_pool_init (vlib_main_t *vm, vlib_buffer_pool_t *bp,
 		 buffer_mem_start, *bp->buffers, 0)),
 	       sizeof (struct rte_mbuf));
 
-  /* stamp vlib templates and verify index round-trip for every object */
+  /* stamp vlib templates and verify index round-trip for every object.  A
+     release-build check, not an ASSERT: a layout disagreement between vlib's
+     buffer-index granularity and DPDK's object alignment corrupts memory
+     arbitrarily far from its cause once the pool is live, so a mismatched
+     build must be refused at init, in every build type. */
   for (i = 0; i < mp->populated_size; i++)
     {
       vlib_buffer_t *b =
 	vlib_buffer_ptr_from_index (buffer_mem_start, bp->buffers[i], 0);
       b->template = bp->buffer_template;
-      ASSERT (vlib_get_buffer (vm, vlib_get_buffer_index (vm, b)) == b);
+      if (PREDICT_FALSE (vlib_get_buffer (vm, vlib_get_buffer_index (vm, b)) !=
+			 b))
+	{
+	  rte_mempool_free (mp);
+	  dpdk_mempool_by_buffer_pool_index[bp->index] = 0;
+	  return clib_error_return (
+	    0,
+	    "HW buffer pool %u: object %u does not round-trip through the "
+	    "vlib buffer index grid; vlib and DPDK disagree on object "
+	    "placement.  Rebuild VPP with -DVPP_CACHE_LINE_SIZE=%u to match "
+	    "DPDK's RTE_CACHE_LINE_SIZE",
+	    bp->index, i, (u32) RTE_CACHE_LINE_SIZE);
+	}
     }
 
   /* Buffers now live in the hardware pool; vlib's main pool must not also hand
