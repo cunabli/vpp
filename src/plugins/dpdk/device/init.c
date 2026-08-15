@@ -1195,6 +1195,9 @@ dpdk_config (vlib_main_t * vm, unformat_input_t * input)
       else if (unformat (input, "telemetry"))
 	conf->enable_telemetry = 1;
 
+      else if (unformat (input, "hw-buffer-pools"))
+	conf->hw_buffer_pools = 1;
+
       else if (unformat (input, "enable-tcp-udp-checksum"))
 	{
 	  dm->default_port_conf.enable_tcp_udp_checksum = 1;
@@ -1568,6 +1571,13 @@ dpdk_config (vlib_main_t * vm, unformat_input_t * input)
 
   /* main thread 1st */
   if ((error = dpdk_buffer_pools_create (vm)))
+    return error;
+
+  /* attach the vlib alloc/free backend to any hardware-backed (DPBP) pool.
+     No-op when no hardware pool exists.  dpdk buffer pools are
+     process-lifetime, so the matching dpdk_buffer_deregister_hw_backend() has
+     no runtime teardown call site here. */
+  if ((error = dpdk_buffer_register_hw_backend (vm)))
     return error;
 
   return 0;

@@ -8,6 +8,7 @@
 
 #include <rte_config.h>
 #include <rte_mbuf.h>
+#include <rte_mbuf_pool_ops.h>
 #include <rte_ethdev.h>
 #include <rte_cryptodev.h>
 #include <rte_vfio.h>
@@ -15,6 +16,7 @@
 
 #include <vlib/vlib.h>
 #include <dpdk/buffer.h>
+#include <dpdk/device/dpdk.h>
 
 STATIC_ASSERT (VLIB_BUFFER_PRE_DATA_SIZE == RTE_PKTMBUF_HEADROOM,
 	       "VLIB_BUFFER_PRE_DATA_SIZE must be equal to RTE_PKTMBUF_HEADROOM");
@@ -24,10 +26,227 @@ extern struct rte_mbuf *dpdk_mbuf_template_by_pool_index;
 struct rte_mempool **dpdk_mempool_by_buffer_pool_index = 0;
 struct rte_mempool **dpdk_no_cache_mempool_by_buffer_pool_index = 0;
 struct rte_mbuf *dpdk_mbuf_template_by_pool_index = 0;
+/* 1 for pools backed by a hardware mempool (e.g. DPAA2/QBMan DPBP) */
+u8 *dpdk_buffer_pool_is_hw = 0;
+
+/* Return the platform/user hardware mempool ops name (e.g. "dpaa2") if one is
+   registered, else 0.  The DPAA2 fslmc bus calls
+   rte_mbuf_set_platform_mempool_ops("dpaa2") when a DPBP object exists, which
+   makes best_mempool_ops() differ from the compiled-in default.  That
+   difference is our signal to build a hardware-backed pool.
+   Note this keys on best != default, so an explicit --mbuf-pool-ops-name
+   also selects this path -- which is the operator asking for it. */
+static const char *
+dpdk_hw_pool_ops_name (void)
+{
+  const char *best = rte_mbuf_best_mempool_ops ();
+  if (best && strcmp (best, RTE_MBUF_DEFAULT_MEMPOOL_OPS) != 0)
+    return best;
+  return 0;
+}
+
+struct dpdk_rewrite_args
+{
+  vlib_main_t *vm;
+  vlib_buffer_pool_t *bp;
+};
+
+/* rte_mempool_obj_iter callback: rebuild bp->buffers[] in the mempool's object
+   order.  Address-derived, so it is correct regardless of the order in which
+   rte_mempool_populate_iova enumerated objects. */
+static void
+dpdk_rewrite_vlib_bufs (struct rte_mempool *mp, void *opaque, void *obj,
+			unsigned i)
+{
+  struct dpdk_rewrite_args *args = opaque;
+  vlib_buffer_t *b = vlib_buffer_from_rte_mbuf ((struct rte_mbuf *) obj);
+  args->bp->buffers[i] = vlib_get_buffer_index (args->vm, b);
+}
+
+/* Hardware-backed pool init: the buffers live in a QBMan/DPBP mempool with
+   platform ops, so net/dpaa2 RX queue setup can resolve a bpid.  The stock
+   "vpp"/"vpp-no-cache" pair is skipped — QBMan owns the pool. */
+static clib_error_t *
+dpdk_hw_buffer_pool_init (vlib_main_t *vm, vlib_buffer_pool_t *bp,
+			  const char *mp_ops_name)
+{
+  uword buffer_mem_start = vm->buffer_main->buffer_mem_start;
+  struct rte_mempool *mp;
+  struct rte_pktmbuf_pool_private priv;
+  enum rte_iova_mode iova_mode = rte_eal_iova_mode ();
+  vlib_physmem_map_t *pm;
+  struct dpdk_rewrite_args args;
+  size_t page_sz;
+  u8 *name = 0;
+  u32 i;
+  int do_vfio_map = 1;
+
+  u32 elt_size =
+    sizeof (struct rte_mbuf) + sizeof (vlib_buffer_t) + bp->data_size;
+
+  vec_validate_aligned (dpdk_mempool_by_buffer_pool_index, bp->index,
+			CLIB_CACHE_LINE_BYTES);
+  vec_validate_aligned (dpdk_no_cache_mempool_by_buffer_pool_index, bp->index,
+			CLIB_CACHE_LINE_BYTES);
+  vec_validate_aligned (dpdk_buffer_pool_is_hw, bp->index,
+			CLIB_CACHE_LINE_BYTES);
+
+  name = format (name, "vpp pool %u%c", bp->index, 0);
+  /* 512-deep per-lcore cache: saves a QBMan acquire/release round-trip per
+     buffer; holds back at most lcores * 512 buffers from the hardware. */
+  mp = rte_mempool_create_empty ((char *) name, bp->n_buffers, elt_size, 512,
+				 sizeof (priv), bp->numa_node, 0);
+  vec_free (name);
+  if (!mp)
+    return clib_error_return (0, "failed to create HW mempool for pool %u",
+			      bp->index);
+
+  dpdk_mempool_by_buffer_pool_index[bp->index] = mp;
+  dpdk_no_cache_mempool_by_buffer_pool_index[bp->index] = 0;
+
+  /* Deliberately NOT setting mp->pool_id here.  It is a union with pool_data
+     (rte_mempool.h), and on this path the pool's ops belong to the platform
+     driver, which owns pool_data: net/dpaa2 stores its bp_info there during
+     .alloc and dereferences it on every TX.  Writing pool_id would be
+     clobbered by .alloc during populate below, and in the reverse order it
+     corrupts the driver's pointer.  Nothing reads pool_id for a HW pool
+     anyway -- every reader lives in the "vpp" / "vpp-no-cache" ops, which
+     only the software path registers.  Use
+     dpdk_mempool_by_buffer_pool_index[] for mp lookup instead. */
+
+  /* platform ops (e.g. "dpaa2") — resolves a bpid net/dpaa2 RX requires */
+  rte_mempool_set_ops_byname (mp, mp_ops_name, NULL);
+
+  clib_memset (&priv, 0, sizeof (priv));
+  priv.mbuf_data_room_size =
+    VLIB_BUFFER_PRE_DATA_SIZE + vlib_buffer_get_default_data_size (vm);
+  priv.mbuf_priv_size = VLIB_BUFFER_HDR_SIZE;
+  rte_pktmbuf_pool_init (mp, &priv);
+
+  /* populate from vlib physmem pages + VFIO DMA map (seeds QBMan) */
+  pm = vlib_physmem_get_map (vm, bp->physmem_map_index);
+  page_sz = 1ULL << pm->log2_page_size;
+  for (i = 0; i < pm->n_pages; i++)
+    {
+      char *va = ((char *) pm->base) + i * page_sz;
+      uword pa = (iova_mode == RTE_IOVA_VA) ? pointer_to_uword (va) :
+						    pm->page_table[i];
+      int ret = rte_mempool_populate_iova (mp, va, pa, page_sz, 0, 0);
+      if (ret < 0)
+	{
+	  rte_mempool_free (mp);
+	  dpdk_mempool_by_buffer_pool_index[bp->index] = 0;
+	  return clib_error_return (
+	    0, "failed to populate HW mempool pool %u page %u: %d", bp->index,
+	    i, ret);
+	}
+      if (do_vfio_map &&
+	  rte_vfio_container_dma_map (RTE_VFIO_DEFAULT_CONTAINER_FD,
+				      pointer_to_uword (va), pa, page_sz))
+	do_vfio_map = 0;
+    }
+
+  /* rebuild bp->buffers[] in object order, then run object initializers */
+  args.vm = vm;
+  args.bp = bp;
+  rte_mempool_obj_iter (mp, dpdk_rewrite_vlib_bufs, &args);
+  rte_mempool_obj_iter (mp, rte_pktmbuf_init, 0);
+
+  /* mbuf header template from the first object */
+  vec_validate_aligned (dpdk_mbuf_template_by_pool_index, bp->index,
+			CLIB_CACHE_LINE_BYTES);
+  clib_memcpy (vec_elt_at_index (dpdk_mbuf_template_by_pool_index, bp->index),
+	       rte_mbuf_from_vlib_buffer (vlib_buffer_ptr_from_index (
+		 buffer_mem_start, *bp->buffers, 0)),
+	       sizeof (struct rte_mbuf));
+
+  /* stamp vlib templates and verify index round-trip for every object */
+  for (i = 0; i < mp->populated_size; i++)
+    {
+      vlib_buffer_t *b =
+	vlib_buffer_ptr_from_index (buffer_mem_start, bp->buffers[i], 0);
+      b->template = bp->buffer_template;
+      ASSERT (vlib_get_buffer (vm, vlib_get_buffer_index (vm, b)) == b);
+    }
+
+  /* Buffers now live in the hardware pool; vlib's main pool must not also hand
+     them out.  The backend ops (registered post-create) own allocation. */
+  bp->n_avail = 0;
+  dpdk_buffer_pool_is_hw[bp->index] = 1;
+
+  /* Pool sizing is bounded by the seeded physmem, not by any MC per-pool cap,
+     so report requested vs populated. */
+  vlib_log_notice (vm->buffer_main->log_default,
+		   "HW buffer pool %u (%s): requested %u, populated %u buffers",
+		   bp->index, mp_ops_name, bp->n_buffers, mp->populated_size);
+
+  return 0;
+}
+
+/* vlib backend alloc op: acquire buffers from the hardware mempool (QBMan).
+   Honors partial results — returns however many it could supply. */
+static u32
+dpdk_hw_pool_alloc (vlib_main_t *vm, vlib_buffer_pool_t *bp, u32 *buffers,
+		    u32 n_buffers)
+{
+  struct rte_mempool *mp = dpdk_mempool_by_buffer_pool_index[bp->index];
+  struct rte_mbuf *mb[256];
+  u32 n_done = 0;
+
+  while (n_done < n_buffers)
+    {
+      u32 n = clib_min (n_buffers - n_done, ARRAY_LEN (mb));
+      u32 avail = rte_mempool_avail_count (mp);
+      if (n > avail)
+	n = avail;
+      /* On a concurrent-drain race get_bulk fails and we stop here; the
+	 caller falls back to its normal path for the remainder. */
+      if (n == 0 || rte_mempool_get_bulk (mp, (void **) mb, n))
+	break;
+      vlib_get_buffer_indices_with_offset (vm, (void **) mb, buffers + n_done,
+					   n, sizeof (struct rte_mbuf));
+      n_done += n;
+    }
+  return n_done;
+}
+
+/* vlib backend free op: release buffers back to the hardware mempool (QBMan). */
+static void
+dpdk_hw_pool_free (vlib_main_t *vm, vlib_buffer_pool_t *bp, u32 *buffers,
+		   u32 n_buffers)
+{
+  struct rte_mempool *mp = dpdk_mempool_by_buffer_pool_index[bp->index];
+  struct rte_mbuf *mb[256];
+  u32 n_done = 0;
+
+  while (n_done < n_buffers)
+    {
+      u32 n = clib_min (n_buffers - n_done, ARRAY_LEN (mb));
+      vlib_get_buffers_with_offset (vm, buffers + n_done, (void **) mb, n,
+				    -(i32) sizeof (struct rte_mbuf));
+      rte_mempool_put_bulk (mp, (void **) mb, n);
+      n_done += n;
+    }
+}
 
 clib_error_t *
 dpdk_buffer_pool_init (vlib_main_t * vm, vlib_buffer_pool_t * bp)
 {
+  /* Hardware-backed pools are strictly opt-in: the ops heuristic is consulted
+     only when the operator set `dpdk { hw-buffer-pools }`.  Without the knob
+     this is the unmodified stock path on every platform, including ones whose
+     DPDK registers platform mempool ops (fslmc, cnxk, octeontx, dpaa, or an
+     explicit --mbuf-pool-ops-name). */
+  if (dpdk_config_main.hw_buffer_pools)
+    {
+      const char *hw_ops = dpdk_hw_pool_ops_name ();
+      if (!hw_ops)
+	return clib_error_return (
+	  0, "dpdk { hw-buffer-pools } is set but no platform/hardware "
+	     "mempool ops are registered on this system");
+      return dpdk_hw_buffer_pool_init (vm, bp, hw_ops);
+    }
+
   uword buffer_mem_start = vm->buffer_main->buffer_mem_start;
   struct rte_mempool *mp, *nmp;
   struct rte_pktmbuf_pool_private priv;
@@ -404,6 +623,49 @@ dpdk_ops_vpp_get_count_no_cache (const struct rte_mempool *mp)
   struct rte_mempool *cmp;
   cmp = dpdk_no_cache_mempool_by_buffer_pool_index[mp->pool_id];
   return dpdk_ops_vpp_get_count (cmp);
+}
+
+/* vlib backend count op: true availability straight from the hardware mempool,
+   so `show buffers` and the stats gauges report populated-minus-in-flight
+   rather than the zero a backend-owned pool keeps in n_avail. */
+static u32
+dpdk_hw_pool_count (vlib_main_t *vm, vlib_buffer_pool_t *bp)
+{
+  return rte_mempool_avail_count (dpdk_mempool_by_buffer_pool_index[bp->index]);
+}
+
+/* Attach the vlib alloc/free backend ops to every hardware-backed pool.
+   Called post-pool-create from the dpdk init path. */
+clib_error_t *
+dpdk_buffer_register_hw_backend (vlib_main_t *vm)
+{
+  vlib_buffer_pool_t *bp;
+  vlib_buffer_pool_backend_ops_t ops = {
+    .alloc = dpdk_hw_pool_alloc,
+    .free = dpdk_hw_pool_free,
+    .count = dpdk_hw_pool_count,
+  };
+
+  vec_foreach (bp, vm->buffer_main->buffer_pools)
+    if (bp->index < vec_len (dpdk_buffer_pool_is_hw) &&
+	dpdk_buffer_pool_is_hw[bp->index])
+      if (vlib_buffer_pool_set_backend_ops (vm, bp->index, ops))
+	return clib_error_return (
+	  0, "failed to register HW backend ops for pool %u", bp->index);
+  return 0;
+}
+
+/* Detach the backend ops (teardown / interface delete-re-add). */
+void
+dpdk_buffer_deregister_hw_backend (vlib_main_t *vm)
+{
+  vlib_buffer_pool_t *bp;
+  vlib_buffer_pool_backend_ops_t none = { 0 };
+
+  vec_foreach (bp, vm->buffer_main->buffer_pools)
+    if (bp->index < vec_len (dpdk_buffer_pool_is_hw) &&
+	dpdk_buffer_pool_is_hw[bp->index])
+      vlib_buffer_pool_set_backend_ops (vm, bp->index, none);
 }
 
 clib_error_t *

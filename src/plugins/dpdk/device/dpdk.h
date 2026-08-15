@@ -282,6 +282,11 @@ typedef struct
   u8 *uio_driver_name;
   u8 uio_bind_force;
   u8 enable_telemetry;
+  /* opt-in: back vlib buffer pools with the platform's hardware mempool
+     (e.g. DPAA2/QBMan DPBP) when its DPDK registers platform mempool ops.
+     Off by default: without it, pool creation is the stock vpp/vpp-no-cache
+     path on every platform. */
+  u8 hw_buffer_pools;
   u16 max_simd_bitwidth;
 
 #define DPDK_MAX_SIMD_BITWIDTH_DEFAULT 0
