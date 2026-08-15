@@ -144,6 +144,7 @@ add_vpp_plugin(dpdk
   dpaa2_ipsec/dpaa2_ipsec_session.c
   dpaa2_ipsec/dpaa2_ipsec_node.c
   dpaa2_ipsec/dpaa2_ipsec_cli.c
+  dpaa2_ipsec/dpaa2_config.c
 
   MULTIARCH_SOURCES
   buffer.c
@@ -171,3 +172,14 @@ add_vpp_plugin(dpdk
 add_vpp_test(test_dpaa2_ipsec_gate
   SOURCES dpaa2_ipsec/test_dpaa2_ipsec_gate.c
 )
+
+# Device-free tripwire that the `dpaa2 {}` block stays an EARLY config function
+# (so DPRC is set before the fslmc getenv in rte_eal_init). Source-level scan of
+# dpaa2_config.c; no VPP/DPDK link.
+add_vpp_test(test_dpaa2_config
+  SOURCES dpaa2_ipsec/test_dpaa2_config.c
+)
+if(TARGET test_dpaa2_config)
+  target_compile_definitions(test_dpaa2_config PRIVATE
+    DPAA2_CONFIG_SRC="${CMAKE_CURRENT_SOURCE_DIR}/dpaa2_ipsec/dpaa2_config.c")
+endif()

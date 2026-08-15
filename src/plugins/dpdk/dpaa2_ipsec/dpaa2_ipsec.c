@@ -166,27 +166,6 @@ dpaa2_ipsec_assign_offload_thread (u32 thread_index)
   return dm->qp_workers[i];
 }
 
-static clib_error_t *
-dpaa2_ipsec_config (vlib_main_t *vm, unformat_input_t *input)
-{
-  dpaa2_ipsec_main_t *dm = &dpaa2_ipsec_main;
-
-  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
-    {
-      /* Global lever: turn SEC ESP offload off entirely (all SAs then use the
-       * async fallback). Absent, offload is enabled (capability-only). */
-      if (unformat (input, "disable"))
-	dm->offload_disabled = 1;
-      else
-	return clib_error_return (0, "unknown input `%U'",
-				  format_unformat_error, input);
-    }
-
-  return 0;
-}
-
-VLIB_CONFIG_FUNCTION (dpaa2_ipsec_config, "dpaa2-ipsec");
-
 /* Install node-index steering (D1'): repoint the core's ESP tunnel node indices
  * at our demux nodes so every tunnel SA -- offloaded or fallback -- enters the
  * plugin first. This must run once at init, before any tunnel protection is
