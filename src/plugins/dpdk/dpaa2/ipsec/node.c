@@ -1,0 +1,931 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 Carlos Aguado.
+ *
+ * DPAA2 IPsec full-ESP protocol offload: encrypt/decrypt steering nodes.
+ *
+ * These are the demux nodes that own the ESP tunnel next-node indices
+ * (im->esp{4,6}_{encrypt,decrypt}_tun_node_index; substituted by the core at
+ * provider registration). One node runs for every tunnel SA of its
+ * family/direction. Per packet
+ * it reads the SA index, consults the cached per-SA routing decision, and:
+ *
+ *   - offload: attaches the SA's rte_security session to a crypto op, points it
+ *     at the packet's mbuf, and enqueues it to this worker's SEC queue-pair.
+ *     SEC then performs the entire ESP transform (encap/decap, crypto, IV, seq,
+ *     anti-replay). The buffer leaves the graph here; the poll node re-injects
+ *     it when SEC completes.
+ *
+ *   - fallback: forwards the buffer unchanged to the original built-in ESP node
+ *     (the async cryptodev path), so SAs the device cannot honour still work.
+ *
+ * For lookaside PROTOCOL the op needs nothing but the session and the source
+ * mbuf -- no per-op IV/AAD/digest wiring, since SEC owns the whole transform.
+ * That also means no custom op private is needed: the completion carries the
+ * mbuf (recoverable to the vlib buffer), and the buffer still holds the SA
+ * index, so the poll node reconstructs everything it needs.
+ */
+
+#include <vlib/vlib.h>
+#include <vnet/vnet.h>
+#include <vnet/ipsec/ipsec.h>
+#include <vnet/ipsec/ipsec_tun.h>
+#include <vnet/ipsec/ipsec_funcs.h>
+
+#include "ipsec.h"
+
+#include <dpdk/device/dpdk.h>
+#include <dpdk/buffer.h>
+#undef always_inline
+#include <rte_cryptodev.h>
+#include <rte_crypto.h>
+#include <rte_crypto_sym.h>
+#include <rte_security.h>
+#include <rte_mbuf.h>
+#include <rte_config.h>
+
+#if CLIB_DEBUG > 0
+#define always_inline static inline
+#else
+#define always_inline static inline __attribute__ ((__always_inline__))
+#endif
+
+/* The demux (producer) arms this poll node (consumer) after each enqueue. */
+extern vlib_node_registration_t dpaa2_ipsec_poll_node;
+
+/* Crypto ops per worker pool. One op per in-flight offloaded packet, so this
+ * caps a worker's SEC-inflight depth; sized above a full vector plus headroom
+ * for the split-phase (enqueued-but-not-dequeued) window. */
+#define DPAA2_IPSEC_N_COPS 2048
+
+/* Worst-case SEC encap prepend on the encrypt path: outer IPv6 (40) + UDP
+ * encap (8) + ESP header (8) + IV (16) = 72 bytes. One conservative constant
+ * for every SA beats per-SA arithmetic on the fast path; a buffer with less
+ * first-segment headroom falls back to the software ESP node, which grows
+ * into headroom with its own bounds checking. */
+#define DPAA2_IPSEC_ENCAP_HEADROOM 72
+
+#define foreach_dpaa2_ipsec_next                                              \
+  _ (FALLBACK, "fallback") /* set per node to the built-in ESP node */        \
+  _ (HANDOFF, "handoff")   /* set per node to the built-in ESP handoff node */ \
+  _ (DROP, "error-drop")
+
+typedef enum
+{
+#define _(n, s) DPAA2_IPSEC_NEXT_##n,
+  foreach_dpaa2_ipsec_next
+#undef _
+    DPAA2_IPSEC_N_NEXT,
+} dpaa2_ipsec_next_t;
+
+#define foreach_dpaa2_ipsec_error                                             \
+  _ (RX, "packets received")                                                  \
+  _ (OFFLOAD, "packets offloaded to SEC")                                     \
+  _ (HANDOFF, "packets handed off to the SA's worker")                        \
+  _ (FALLBACK, "packets sent to software fallback")                           \
+  _ (CHAINED, "chained buffer (fell back)")                                   \
+  _ (NO_HEADROOM, "not enough headroom for SEC encap (fell back)")            \
+  _ (COP_ALLOC, "crypto-op alloc failed (fell back)")                         \
+  _ (ENQ_FAIL, "SEC enqueue failed, queue full (dropped)")
+
+typedef enum
+{
+#define _(n, s) DPAA2_IPSEC_ERROR_##n,
+  foreach_dpaa2_ipsec_error
+#undef _
+    DPAA2_IPSEC_N_ERROR,
+} dpaa2_ipsec_error_t;
+
+static char *dpaa2_ipsec_error_strings[] = {
+#define _(n, s) s,
+  foreach_dpaa2_ipsec_error
+#undef _
+};
+
+typedef struct
+{
+  u32 sa_index;
+  u8 offloaded;
+} dpaa2_ipsec_trace_t;
+
+static u8 *
+format_dpaa2_ipsec_trace (u8 *s, va_list *args)
+{
+  CLIB_UNUSED (vlib_main_t * vm) = va_arg (*args, vlib_main_t *);
+  CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
+  dpaa2_ipsec_trace_t *t = va_arg (*args, dpaa2_ipsec_trace_t *);
+
+  s = format (s, "sa %u -> %s", t->sa_index,
+	      t->offloaded ? "SEC offload" : "fallback");
+  return s;
+}
+
+/* Lazily create this worker's crypto-op pool on the SECURITY device's socket. */
+static struct rte_mempool *
+ensure_cop_pool (dpaa2_ipsec_worker_t *w, u32 thread_index)
+{
+  char name[RTE_MEMPOOL_NAMESIZE];
+
+  if (w->cop_pool)
+    return w->cop_pool;
+
+  snprintf (name, sizeof (name), "dpaa2_ipsec_cop_%u", thread_index);
+  /* priv_size 0: lookaside-protocol needs no per-op scratch. */
+  w->cop_pool = rte_crypto_op_pool_create (
+    name, RTE_CRYPTO_OP_TYPE_SYMMETRIC, DPAA2_IPSEC_N_COPS, 256, 0,
+    rte_cryptodev_socket_id (w->dev_id));
+  return w->cop_pool;
+}
+
+/* Sync the vlib buffer's geometry into its rte_mbuf so SEC sees the packet the
+ * node sees. Mirrors the dpdk plugin's own dpdk_validate_rte_mbuf (which is
+ * file-static and cannot be linked). Single-segment by construction: the demux
+ * routes any chained buffer (VLIB_BUFFER_NEXT_PRESENT) to the software
+ * fallback before this point, so enqueue and completion resync agree on
+ * one-segment geometry as an enforced invariant.
+ * Deliberately drops the ref_count>1 pool-swap the TX path does for cloned
+ * buffers -- crypto never enqueues clones; add it only if that changes. */
+static_always_inline void
+dpaa2_ipsec_mbuf_sync (vlib_main_t *vm, vlib_buffer_t *b)
+{
+  struct rte_mbuf *mb = rte_mbuf_from_vlib_buffer (b);
+
+  if (PREDICT_FALSE ((b->flags & VLIB_BUFFER_EXT_HDR_VALID) == 0))
+    rte_pktmbuf_reset (mb);
+
+  mb->nb_segs = 1;
+  mb->data_len = b->current_length;
+  mb->pkt_len = b->current_length;
+  mb->data_off = VLIB_BUFFER_PRE_DATA_SIZE + b->current_data;
+}
+
+static_always_inline uword
+dpaa2_ipsec_offload_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
+			    vlib_frame_t *frame, int is_decrypt)
+{
+  dpaa2_ipsec_main_t *dm = &dpaa2_ipsec_main;
+  u32 thread_index = vm->thread_index;
+  dpaa2_ipsec_worker_t *w = (thread_index < vec_len (dm->workers))
+			      ? vec_elt_at_index (dm->workers, thread_index)
+			      : 0;
+  u32 *from = vlib_frame_vector_args (frame);
+  u32 n_left = frame->n_vectors;
+
+  /* Buffers that stay in the graph (fallback or drop) collected with their
+   * next; offloaded+enqueued buffers leave the graph and are not listed. */
+  u32 to_graph[VLIB_FRAME_SIZE], *tg = to_graph;
+  u16 nexts[VLIB_FRAME_SIZE], *nx = nexts;
+  struct rte_crypto_op *ops[VLIB_FRAME_SIZE];
+  u32 op_bi[VLIB_FRAME_SIZE];
+  u32 op_sad[VLIB_FRAME_SIZE]; /* SA of each built op, for per-session inflight */
+  u32 n_off = 0, n_fb = 0, n_cop_fail = 0, n_ho = 0;
+  u32 n_chained = 0, n_no_headroom = 0;
+
+  int have_qp = w && w->dev_id != DPAA2_IPSEC_INVALID_U16;
+  struct rte_mempool *cop_pool =
+    have_qp ? ensure_cop_pool (w, thread_index) : 0;
+
+  while (n_left > 0)
+    {
+      u32 bi = from[0];
+      vlib_buffer_t *b = vlib_get_buffer (vm, bi);
+      u32 sa_index;
+      void *sess = 0;
+
+      from += 1;
+      n_left -= 1;
+
+      if (is_decrypt)
+	sa_index = vnet_buffer (b)->ipsec.sad_index;
+      else
+	{
+	  /* Encrypt tunnel: resolve the SA through the adjacency, as the
+	   * built-in esp*-encrypt-tun node does. */
+	  sa_index = ipsec_tun_protect_get_sa_out (
+	    vnet_buffer (b)->ip.adj_index[VLIB_TX]);
+	  vnet_buffer (b)->ipsec.sad_index = sa_index;
+	}
+
+      /* Routing is a cached per-SA property (see the header), not per-worker.
+       * Sessions are directional: encrypt uses egress, decrypt uses ingress. */
+      if (sa_index < vec_len (dm->sa_route) &&
+	  dm->sa_route[sa_index].decision == DPAA2_IPSEC_ROUTE_OFFLOAD)
+	sess = is_decrypt ? dm->sa_session[sa_index].ingress
+			  : dm->sa_session[sa_index].egress;
+
+      if (sess)
+	{
+	  /* Chained buffers never reach SEC: completion resync is single-seg
+	   * by construction (see dpaa2_ipsec_mbuf_sync), and SEC's chained-FD
+	   * completion geometry is uncharacterized. The software ESP path
+	   * handles chains, so fall back -- the SA's SEC session is unused for
+	   * this packet but its sequence/replay state is untouched either way:
+	   * the software path owns the whole SA when packets can chain. */
+	  if (PREDICT_FALSE (b->flags & VLIB_BUFFER_NEXT_PRESENT))
+	    {
+	      tg[0] = bi;
+	      nx[0] = DPAA2_IPSEC_NEXT_FALLBACK;
+	      tg += 1;
+	      nx += 1;
+	      n_chained += 1;
+	      sess = 0; /* trace as fallback */
+	      goto trace;
+	    }
+
+	  /* SEC encap prepends into mbuf headroom; a first segment without
+	   * room for the worst-case prepend must not reach the device, or the
+	   * write would precede the mbuf object start. */
+	  if (!is_decrypt &&
+	      PREDICT_FALSE ((i32) (VLIB_BUFFER_PRE_DATA_SIZE +
+				    b->current_data) <
+			     DPAA2_IPSEC_ENCAP_HEADROOM))
+	    {
+	      tg[0] = bi;
+	      nx[0] = DPAA2_IPSEC_NEXT_FALLBACK;
+	      tg += 1;
+	      nx += 1;
+	      n_no_headroom += 1;
+	      sess = 0; /* trace as fallback */
+	      goto trace;
+	    }
+
+	  /* One SA is pinned to one worker's queue-pair for its lifetime:
+	   * SEC keeps the SA's sequence/replay state, so every packet must reach
+	   * that worker before enqueue. The first packet claims one via
+	   * cmp-and-swap, constrained to the qp-owning workers (so the pinned
+	   * worker can actually enqueue), mirroring the built-in ESP handoff we
+	   * displaced. */
+	  clib_thread_index_t sa_ti;
+	  if (is_decrypt)
+	    {
+	      ipsec_sa_inb_rt_t *rt = ipsec_sa_get_inb_rt_by_index (sa_index);
+	      if (PREDICT_FALSE (rt->thread_index == (clib_thread_index_t) ~0))
+		clib_atomic_cmp_and_swap (&rt->thread_index, ~0,
+					  dpaa2_ipsec_assign_offload_thread (thread_index));
+	      sa_ti = rt->thread_index;
+	    }
+	  else
+	    {
+	      ipsec_sa_outb_rt_t *rt = ipsec_sa_get_outb_rt_by_index (sa_index);
+	      if (PREDICT_FALSE (rt->thread_index == (clib_thread_index_t) ~0))
+		clib_atomic_cmp_and_swap (&rt->thread_index, ~0,
+					  dpaa2_ipsec_assign_offload_thread (thread_index));
+	      sa_ti = rt->thread_index;
+	    }
+
+	  if (PREDICT_FALSE (thread_index != sa_ti))
+	    {
+	      /* Not the SA's worker: hand off. The ESP handoff frame queue is
+	       * bound to the tunnel node index we own, so the packet re-enters
+	       * this demux on the pinned worker (wired by the core when the
+	       * provider registered). */
+	      vnet_buffer (b)->ipsec.thread_index = sa_ti;
+	      tg[0] = bi;
+	      nx[0] = DPAA2_IPSEC_NEXT_HANDOFF;
+	      tg += 1;
+	      nx += 1;
+	      n_ho += 1;
+	      goto trace;
+	    }
+
+	  if (PREDICT_FALSE (cop_pool == 0))
+	    {
+	      /* Pinned here but this worker holds no SEC queue-pair: keep the
+	       * whole SA on software rather than fracture it. */
+	      tg[0] = bi;
+	      nx[0] = DPAA2_IPSEC_NEXT_FALLBACK;
+	      tg += 1;
+	      nx += 1;
+	      n_fb += 1;
+	      goto trace;
+	    }
+
+	  struct rte_crypto_op *op =
+	    rte_crypto_op_alloc (cop_pool, RTE_CRYPTO_OP_TYPE_SYMMETRIC);
+	  if (PREDICT_FALSE (op == 0))
+	    {
+	      /* Transient pool exhaustion: fall back this packet, don't drop it. */
+	      tg[0] = bi;
+	      nx[0] = DPAA2_IPSEC_NEXT_FALLBACK;
+	      tg += 1;
+	      nx += 1;
+	      n_cop_fail += 1;
+	      goto trace;
+	    }
+	  rte_security_attach_session (op, sess);
+	  op->sym->m_src = rte_mbuf_from_vlib_buffer (b);
+	  /* Encap only: an explicit destination routes dpaa2_sec through the
+	   * compound-FD path; the single-buffer path puts SEC in allocate mode,
+	   * which rejects our VPP-pool buffer on the growing encap (QI frc
+	   * 0x..45). Decap shrinks and stays on the single path. */
+	  if (!is_decrypt)
+	    op->sym->m_dst = op->sym->m_src;
+	  else
+	    {
+	      /* SEC decap consumes the packet from the OUTER IP header (it strips
+	       * sizeof(ip)); the tun-decrypt path already advanced current_data to
+	       * the ESP header, so rewind to the recorded L3 offset. Else SEC reads
+	       * ESP bytes as the outer IP and the descriptor faults (DECO 0x10). */
+	      i16 l3 = vnet_buffer (b)->l3_hdr_offset;
+	      if (b->current_data > l3)
+		vlib_buffer_advance (b, (word) (l3 - b->current_data));
+	    }
+	  dpaa2_ipsec_mbuf_sync (vm, b);
+	  ops[n_off] = op;
+	  op_bi[n_off] = bi;
+	  op_sad[n_off] = sa_index;
+	  n_off += 1;
+	}
+      else
+	{
+	  tg[0] = bi;
+	  nx[0] = DPAA2_IPSEC_NEXT_FALLBACK;
+	  tg += 1;
+	  nx += 1;
+	  n_fb += 1;
+	}
+
+    trace:
+      if (PREDICT_FALSE (b->flags & VLIB_BUFFER_IS_TRACED))
+	{
+	  dpaa2_ipsec_trace_t *t = vlib_add_trace (vm, node, b, sizeof (*t));
+	  t->sa_index = sa_index;
+	  t->offloaded = (sess != 0);
+	}
+    }
+
+  /* One burst enqueue to this worker's SEC queue-pair. */
+  u32 n_enq = 0;
+  if (n_off)
+    {
+      n_enq =
+	rte_cryptodev_enqueue_burst (w->dev_id, w->qp_id, ops, (u16) n_off);
+      w->inflight += n_enq;
+
+      /* Charge each enqueued op to its SA's per-direction session so a deferred
+       * teardown knows when SEC no longer references the session (this node's
+       * direction is fixed by is_decrypt). enqueue_burst takes the first n_enq. */
+      for (u32 i = 0; i < n_enq; i++)
+	{
+	  dpaa2_ipsec_sa_sess_t *s =
+	    vec_elt_at_index (dm->sa_session, op_sad[i]);
+	  if (is_decrypt)
+	    s->ingress_inflight += 1;
+	  else
+	    s->egress_inflight += 1;
+	}
+
+      if (n_enq)
+	/* Wake this worker's poll node to drain what we just queued (the
+	 * producer arms the interrupt INPUT consumer). */
+	vlib_node_set_interrupt_pending (vm, dpaa2_ipsec_poll_node.index);
+
+      if (PREDICT_FALSE (n_enq < n_off))
+	{
+	  /* SEC queue-pair full: drop the un-enqueued packets (bounded, no
+	   * worker block, no corruption) and free their ops back to the pool.
+	   * b->error attributes each drop in `show errors`; error-drop counts it. */
+	  for (u32 i = n_enq; i < n_off; i++)
+	    {
+	      vlib_buffer_t *db = vlib_get_buffer (vm, op_bi[i]);
+	      db->error = node->errors[DPAA2_IPSEC_ERROR_ENQ_FAIL];
+	      tg[0] = op_bi[i];
+	      nx[0] = DPAA2_IPSEC_NEXT_DROP;
+	      tg += 1;
+	      nx += 1;
+	    }
+	  rte_mempool_put_bulk (cop_pool, (void **) &ops[n_enq], n_off - n_enq);
+	}
+    }
+
+  u32 n_to_graph = tg - to_graph;
+  if (n_to_graph)
+    vlib_buffer_enqueue_to_next (vm, node, to_graph, nexts, n_to_graph);
+
+  vlib_node_increment_counter (vm, node->node_index, DPAA2_IPSEC_ERROR_RX,
+			       frame->n_vectors);
+  if (n_enq)
+    vlib_node_increment_counter (vm, node->node_index,
+				 DPAA2_IPSEC_ERROR_OFFLOAD, n_enq);
+  if (n_ho)
+    vlib_node_increment_counter (vm, node->node_index,
+				 DPAA2_IPSEC_ERROR_HANDOFF, n_ho);
+  if (n_fb)
+    vlib_node_increment_counter (vm, node->node_index,
+				 DPAA2_IPSEC_ERROR_FALLBACK, n_fb);
+  if (n_chained)
+    vlib_node_increment_counter (vm, node->node_index,
+				 DPAA2_IPSEC_ERROR_CHAINED, n_chained);
+  if (n_no_headroom)
+    vlib_node_increment_counter (vm, node->node_index,
+				 DPAA2_IPSEC_ERROR_NO_HEADROOM, n_no_headroom);
+  if (n_cop_fail)
+    vlib_node_increment_counter (vm, node->node_index,
+				 DPAA2_IPSEC_ERROR_COP_ALLOC, n_cop_fail);
+  /* ENQ_FAIL drops are counted through b->error by error-drop, not here --
+   * a second increment would double-book them in `show errors`. */
+
+  return frame->n_vectors;
+}
+
+VLIB_NODE_FN (dpaa2_esp4_encrypt_tun_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return dpaa2_ipsec_offload_inline (vm, node, frame, 0 /* encrypt */);
+}
+
+VLIB_NODE_FN (dpaa2_esp6_encrypt_tun_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return dpaa2_ipsec_offload_inline (vm, node, frame, 0 /* encrypt */);
+}
+
+VLIB_NODE_FN (dpaa2_esp4_decrypt_tun_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return dpaa2_ipsec_offload_inline (vm, node, frame, 1 /* decrypt */);
+}
+
+VLIB_NODE_FN (dpaa2_esp6_decrypt_tun_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return dpaa2_ipsec_offload_inline (vm, node, frame, 1 /* decrypt */);
+}
+
+VLIB_REGISTER_NODE (dpaa2_esp4_encrypt_tun_node) = {
+  .name = "dpaa2-esp4-encrypt-tun",
+  .vector_size = sizeof (u32),
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .format_trace = format_dpaa2_ipsec_trace,
+  .n_errors = DPAA2_IPSEC_N_ERROR,
+  .error_strings = dpaa2_ipsec_error_strings,
+  .n_next_nodes = DPAA2_IPSEC_N_NEXT,
+  .next_nodes = {
+    [DPAA2_IPSEC_NEXT_FALLBACK] = "esp4-encrypt-tun",
+    [DPAA2_IPSEC_NEXT_HANDOFF] = "esp4-encrypt-tun-handoff",
+    [DPAA2_IPSEC_NEXT_DROP] = "error-drop",
+  },
+};
+
+VLIB_REGISTER_NODE (dpaa2_esp6_encrypt_tun_node) = {
+  .name = "dpaa2-esp6-encrypt-tun",
+  .vector_size = sizeof (u32),
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .format_trace = format_dpaa2_ipsec_trace,
+  .n_errors = DPAA2_IPSEC_N_ERROR,
+  .error_strings = dpaa2_ipsec_error_strings,
+  .n_next_nodes = DPAA2_IPSEC_N_NEXT,
+  .next_nodes = {
+    [DPAA2_IPSEC_NEXT_FALLBACK] = "esp6-encrypt-tun",
+    [DPAA2_IPSEC_NEXT_HANDOFF] = "esp6-encrypt-tun-handoff",
+    [DPAA2_IPSEC_NEXT_DROP] = "error-drop",
+  },
+};
+
+VLIB_REGISTER_NODE (dpaa2_esp4_decrypt_tun_node) = {
+  .name = "dpaa2-esp4-decrypt-tun",
+  .vector_size = sizeof (u32),
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .format_trace = format_dpaa2_ipsec_trace,
+  .n_errors = DPAA2_IPSEC_N_ERROR,
+  .error_strings = dpaa2_ipsec_error_strings,
+  .n_next_nodes = DPAA2_IPSEC_N_NEXT,
+  .next_nodes = {
+    [DPAA2_IPSEC_NEXT_FALLBACK] = "esp4-decrypt-tun",
+    [DPAA2_IPSEC_NEXT_HANDOFF] = "esp4-decrypt-tun-handoff",
+    [DPAA2_IPSEC_NEXT_DROP] = "error-drop",
+  },
+};
+
+VLIB_REGISTER_NODE (dpaa2_esp6_decrypt_tun_node) = {
+  .name = "dpaa2-esp6-decrypt-tun",
+  .vector_size = sizeof (u32),
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .format_trace = format_dpaa2_ipsec_trace,
+  .n_errors = DPAA2_IPSEC_N_ERROR,
+  .error_strings = dpaa2_ipsec_error_strings,
+  .n_next_nodes = DPAA2_IPSEC_N_NEXT,
+  .next_nodes = {
+    [DPAA2_IPSEC_NEXT_FALLBACK] = "esp6-decrypt-tun",
+    [DPAA2_IPSEC_NEXT_HANDOFF] = "esp6-decrypt-tun-handoff",
+    [DPAA2_IPSEC_NEXT_DROP] = "error-drop",
+  },
+};
+
+/*
+ * Poll node: the split-phase back half. SEC processes enqueued ops
+ * asynchronously and DMAs each completed packet back; this per-worker node
+ * dequeues those completions and re-injects the packets into the graph.
+ *
+ * It self-gates like the in-tree async engine's `crypto-deq`: an INTERRUPT
+ * INPUT node, quiescent until the demux (producer) arms it on enqueue, and
+ * re-arming itself while SEC still holds ops (tracked by w->inflight -- no
+ * per-SA refcount). Re-entry mirrors the built-in nodes: a decap'd inner
+ * packet routes by its IP version, an encap'd outer packet rides the tunnel's
+ * midchain adjacency out.
+ */
+
+#define foreach_dpaa2_ipsec_poll_next                                         \
+  _ (IP4_INPUT, "ip4-input-no-checksum")                                      \
+  _ (IP6_INPUT, "ip6-input")                                                  \
+  _ (MIDCHAIN_TX, "adj-midchain-tx")                                          \
+  _ (DROP, "error-drop")
+
+typedef enum
+{
+#define _(n, s) DPAA2_IPSEC_POLL_NEXT_##n,
+  foreach_dpaa2_ipsec_poll_next
+#undef _
+    DPAA2_IPSEC_POLL_N_NEXT,
+} dpaa2_ipsec_poll_next_t;
+
+#define foreach_dpaa2_ipsec_poll_error                                        \
+  _ (DEQ, "completions dequeued from SEC")                                    \
+  _ (AUTH_FAIL, "SEC authentication failed (dropped)")                        \
+  _ (STATUS_FAIL, "SEC operation failed (dropped)")                           \
+  _ (STRAGGLER, "completion for a deleted SA (dropped)")
+
+typedef enum
+{
+#define _(n, s) DPAA2_IPSEC_POLL_ERROR_##n,
+  foreach_dpaa2_ipsec_poll_error
+#undef _
+    DPAA2_IPSEC_POLL_N_ERROR,
+} dpaa2_ipsec_poll_error_t;
+
+static char *dpaa2_ipsec_poll_error_strings[] = {
+#define _(n, s) s,
+  foreach_dpaa2_ipsec_poll_error
+#undef _
+};
+
+/* Fold the transform SEC applied back into the vlib buffer. SEC moved the
+ * packet start (decap strips the outer+ESP, encap prepends them) and set the
+ * new length in the mbuf; recover both, using the same computation the dpdk
+ * plugin's own RX path uses to derive a vlib buffer from an mbuf
+ * (device/node.c) -- and the exact inverse of the enqueue-side sync, since the
+ * CMake gate pins RTE_PKTMBUF_HEADROOM == VLIB_BUFFER_PRE_DATA_SIZE.
+ * Single-segment by design: rebuilds only the first segment's geometry. SEC
+ * returns the ESP packet in one segment for MTU-sized traffic; add a chain
+ * walk (next-buffer links + total_length) only if jumbo offload is enabled. */
+static_always_inline void
+dpaa2_ipsec_buffer_resync (vlib_buffer_t *b, struct rte_mbuf *mb)
+{
+  b->current_data = mb->data_off - RTE_PKTMBUF_HEADROOM;
+  b->current_length = mb->data_len;
+}
+
+/* Retire a straggler completion whose SA was deleted (its session was deferred).
+ * The session is found by pointer on this worker's pending-destroy list -- never by
+ * the cache slot, which may already belong to a new SA. Decrements that session's
+ * remaining count and, when it hits zero (SEC no longer references the flow context),
+ * destroys it. Returns the direction (0 egress, 1 ingress) for routing, or -1 if the
+ * session is unknown (already fully drained -- a defensive drop, should not happen). */
+static_always_inline int
+dpaa2_ipsec_pending_retire (dpaa2_ipsec_worker_t *w, void *sess)
+{
+  dpaa2_ipsec_main_t *dm = &dpaa2_ipsec_main;
+
+  for (u32 i = 0; i < vec_len (w->pending_destroy); i++)
+    {
+      dpaa2_ipsec_pending_destroy_t *p =
+	vec_elt_at_index (w->pending_destroy, i);
+      if (p->session != sess)
+	continue;
+
+      int is_ingress = p->is_ingress;
+      if (p->remaining)
+	p->remaining -= 1;
+      if (p->remaining == 0)
+	{
+	  void *sec_ctx = rte_cryptodev_get_sec_ctx (dm->sec_dev_id);
+	  rte_security_session_destroy (sec_ctx, sess);
+	  /* Every qp-owning worker's poll node lands here: atomic RMW. */
+	  clib_atomic_fetch_add (&dm->sessions_drained, 1);
+	  vec_del1 (w->pending_destroy, i); /* order-independent; we return now */
+	}
+      return is_ingress;
+    }
+  return -1;
+}
+
+static_always_inline uword
+dpaa2_ipsec_poll_inline (vlib_main_t *vm, vlib_node_runtime_t *node)
+{
+  dpaa2_ipsec_main_t *dm = &dpaa2_ipsec_main;
+  u32 thread_index = vm->thread_index;
+  dpaa2_ipsec_worker_t *w = (thread_index < vec_len (dm->workers))
+			      ? vec_elt_at_index (dm->workers, thread_index)
+			      : 0;
+
+  if (w == 0 || w->dev_id == DPAA2_IPSEC_INVALID_U16 || w->inflight == 0)
+    return 0;
+
+  struct rte_crypto_op *ops[VLIB_FRAME_SIZE];
+  /* The DPAA2 DQRR ring hands back at most 32 completions per dequeue call, but
+   * the producer (encrypt/decrypt) enqueues a full 256-vector each iteration. A
+   * single 32-burst per poll drains 8x slower than it fills, so in-flight pegs at
+   * the queue-pair's capacity and the excess is shed as enqueue-drop -- the completion harvest,
+   * not SEC, caps throughput. Drain in a loop up to a full frame so the consumer
+   * keeps pace and SEC's real rate sets the ceiling. Bounded by w->inflight (never
+   * more than are outstanding) and by VLIB_FRAME_SIZE (the buffers[] arrays). */
+  u16 want = w->inflight < VLIB_FRAME_SIZE ? w->inflight : VLIB_FRAME_SIZE;
+  u16 n_deq = 0;
+  while (n_deq < want)
+    {
+      u16 got = rte_cryptodev_dequeue_burst (w->dev_id, w->qp_id, ops + n_deq,
+					     want - n_deq);
+      if (got == 0)
+	break;
+      n_deq += got;
+    }
+
+  if (n_deq == 0)
+    {
+      /* SEC still holds ops -- stay scheduled until they drain. */
+      vlib_node_set_interrupt_pending (vm, node->node_index);
+      return 0;
+    }
+
+  u32 bufs[VLIB_FRAME_SIZE];
+  u16 nexts[VLIB_FRAME_SIZE];
+
+  for (u16 i = 0; i < n_deq; i++)
+    {
+      struct rte_crypto_op *op = ops[i];
+      struct rte_mbuf *mb = op->sym->m_src;
+      vlib_buffer_t *b = vlib_buffer_from_rte_mbuf (mb);
+      u16 next;
+
+      /* Prefetch a later completion's head while we work the current one,
+       * hiding the post-DMA cold miss the HW stash did not cover.
+       * Fixed stride 4; the stride and the stash/prefetch split are tuning
+       * knobs measured on silicon, not derived constants. */
+      if (i + 4 < n_deq)
+	CLIB_PREFETCH (rte_pktmbuf_mtod (ops[i + 4]->sym->m_src, void *),
+		       CLIB_CACHE_LINE_BYTES, LOAD);
+
+      dpaa2_ipsec_buffer_resync (b, mb);
+
+      /* Identify the op by its ATTACHED SESSION (the PMD preserves op->sym->session),
+       * not the SA's IS_INBOUND flag -- a tunnel-protect SA is used both ways under
+       * one sa_index. If the session still matches the cache slot it is a current-SA
+       * op: retire it from that slot's per-direction in-flight count. If it matches
+       * neither, the SA was deleted and its session deferred; find it by pointer on
+       * this worker's pending-destroy list and retire it there. Either way the count
+       * that governs the eventual free follows the SESSION, so a straggler can never
+       * touch a different (reused) SA's slot. */
+      u32 sad = vnet_buffer (b)->ipsec.sad_index;
+      void *sess = op->sym->session;
+      dpaa2_ipsec_sa_sess_t *s =
+	sad < vec_len (dm->sa_session) ? vec_elt_at_index (dm->sa_session, sad) : 0;
+      int is_dec = 0, current = 0;
+
+      if (s && sess == s->ingress)
+	{
+	  is_dec = 1;
+	  current = 1;
+	  if (s->ingress_inflight)
+	    s->ingress_inflight -= 1;
+	}
+      else if (s && sess == s->egress)
+	{
+	  is_dec = 0;
+	  current = 1;
+	  if (s->egress_inflight)
+	    s->egress_inflight -= 1;
+	}
+      else
+	dpaa2_ipsec_pending_retire (w, sess);
+
+      /* Drop any completion whose session no longer matches a live cache slot
+       * -- SEC status included, success too: a packet whose SA is gone has no
+       * owner, and its cached adjacency/next may already belong to something
+       * else, so forwarding it would misroute. Its op was still retired above
+       * (pending list, by pointer), so the deferred session drains either way.
+       * b->error attributes every drop; error-drop counts it. */
+      if (PREDICT_FALSE (op->status != RTE_CRYPTO_OP_STATUS_SUCCESS ||
+			 !current))
+	{
+	  next = DPAA2_IPSEC_POLL_NEXT_DROP;
+	  if (op->status == RTE_CRYPTO_OP_STATUS_AUTH_FAILED)
+	    b->error = node->errors[DPAA2_IPSEC_POLL_ERROR_AUTH_FAIL];
+	  else if (op->status != RTE_CRYPTO_OP_STATUS_SUCCESS)
+	    b->error = node->errors[DPAA2_IPSEC_POLL_ERROR_STATUS_FAIL];
+	  else
+	    b->error = node->errors[DPAA2_IPSEC_POLL_ERROR_STRAGGLER];
+	}
+      else
+	{
+	  if (is_dec)
+	    {
+	      /* Tunnel decap: SEC handed us the inner packet; route by its IP
+	       * version, as the built-in decrypt-tun node does. */
+	      u8 *ih = vlib_buffer_get_current (b);
+	      next = ((ih[0] >> 4) == 6) ? DPAA2_IPSEC_POLL_NEXT_IP6_INPUT
+					 : DPAA2_IPSEC_POLL_NEXT_IP4_INPUT;
+	    }
+	  else
+	    /* Tunnel encap: SEC produced the outer ESP packet; the tunnel
+	     * midchain adjacency (still in adj_index[VLIB_TX]) sends it out. */
+	    next = DPAA2_IPSEC_POLL_NEXT_MIDCHAIN_TX;
+
+	  /* Feed the core per-SA counter (the one the built-in ESP nodes feed) so an
+	   * offloaded SA shows packets/bytes in `show ipsec sa` too -- current-SA ops
+	   * only: a straggler's sad_index may now name a different (reused) SA, so
+	   * counting it there would misattribute. Successful transforms only, on-wire
+	   * length. Per-packet increment; batch same-SA runs only if a perf
+	   * pass shows it matters. */
+	  if (current)
+	    vlib_increment_combined_counter (&ipsec_sa_counters, thread_index,
+					     sad, 1,
+					     vlib_buffer_length_in_chain (vm, b));
+	}
+
+      bufs[i] = vlib_get_buffer_index (vm, b);
+      nexts[i] = next;
+
+      if (PREDICT_FALSE (b->flags & VLIB_BUFFER_IS_TRACED))
+	{
+	  dpaa2_ipsec_trace_t *t = vlib_add_trace (vm, node, b, sizeof (*t));
+	  t->sa_index = vnet_buffer (b)->ipsec.sad_index;
+	  t->offloaded = 1;
+	}
+    }
+
+  w->inflight -= n_deq;
+  rte_mempool_put_bulk (w->cop_pool, (void **) ops, n_deq);
+
+  vlib_buffer_enqueue_to_next (vm, node, bufs, nexts, n_deq);
+
+  vlib_node_increment_counter (vm, node->node_index,
+			       DPAA2_IPSEC_POLL_ERROR_DEQ, n_deq);
+  /* AUTH_FAIL / STATUS_FAIL / STRAGGLER drops are counted through b->error by
+   * error-drop -- a second increment here would double-book them. */
+
+  /* More may still be in SEC -- stay scheduled until inflight hits zero. */
+  if (w->inflight)
+    vlib_node_set_interrupt_pending (vm, node->node_index);
+
+  return n_deq;
+}
+
+VLIB_NODE_FN (dpaa2_ipsec_poll_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return dpaa2_ipsec_poll_inline (vm, node);
+}
+
+VLIB_REGISTER_NODE (dpaa2_ipsec_poll_node) = {
+  .name = "dpaa2-ipsec-poll",
+  .type = VLIB_NODE_TYPE_INPUT,
+  .state = VLIB_NODE_STATE_INTERRUPT,
+  .format_trace = format_dpaa2_ipsec_trace,
+  .n_errors = DPAA2_IPSEC_POLL_N_ERROR,
+  .error_strings = dpaa2_ipsec_poll_error_strings,
+  .n_next_nodes = DPAA2_IPSEC_POLL_N_NEXT,
+  .next_nodes = {
+    [DPAA2_IPSEC_POLL_NEXT_IP4_INPUT] = "ip4-input-no-checksum",
+    [DPAA2_IPSEC_POLL_NEXT_IP6_INPUT] = "ip6-input",
+    [DPAA2_IPSEC_POLL_NEXT_MIDCHAIN_TX] = "adj-midchain-tx",
+    [DPAA2_IPSEC_POLL_NEXT_DROP] = "error-drop",
+  },
+};
+
+/* Sum one node error counter across all workers, net of the last `clear` --
+ * the same read the `show errors` command does. */
+static u64
+dpaa2_ipsec_sum_error (vlib_main_t *vm, u32 node_index, u32 err)
+{
+  vlib_node_t *n = vlib_get_node (vm, node_index);
+  u32 idx = n->error_heap_index + err;
+  u64 total = 0;
+
+  foreach_vlib_main ()
+    {
+      vlib_error_main_t *em = &this_vlib_main->error_main;
+      u64 c = em->counters[idx];
+      if (idx < vec_len (em->counters_last_clear))
+	c -= em->counters_last_clear[idx];
+      total += c;
+    }
+  return total;
+}
+
+void
+dpaa2_ipsec_get_stats (dpaa2_ipsec_stats_t *s)
+{
+  vlib_main_t *vm = vlib_get_main ();
+  u32 demux[4] = {
+    dpaa2_esp4_encrypt_tun_node.index,
+    dpaa2_esp6_encrypt_tun_node.index,
+    dpaa2_esp4_decrypt_tun_node.index,
+    dpaa2_esp6_decrypt_tun_node.index,
+  };
+  u32 poll = dpaa2_ipsec_poll_node.index;
+
+  clib_memset (s, 0, sizeof (*s));
+
+  /* The four demux nodes share one error enum; sum each counter over all of
+   * them so the totals are direction/family agnostic. */
+  for (int i = 0; i < 4; i++)
+    {
+      s->rx += dpaa2_ipsec_sum_error (vm, demux[i], DPAA2_IPSEC_ERROR_RX);
+      s->offloaded +=
+	dpaa2_ipsec_sum_error (vm, demux[i], DPAA2_IPSEC_ERROR_OFFLOAD);
+      s->handoff +=
+	dpaa2_ipsec_sum_error (vm, demux[i], DPAA2_IPSEC_ERROR_HANDOFF);
+      s->fallback +=
+	dpaa2_ipsec_sum_error (vm, demux[i], DPAA2_IPSEC_ERROR_FALLBACK);
+      s->cop_fallback +=
+	dpaa2_ipsec_sum_error (vm, demux[i], DPAA2_IPSEC_ERROR_COP_ALLOC);
+      s->enq_drop +=
+	dpaa2_ipsec_sum_error (vm, demux[i], DPAA2_IPSEC_ERROR_ENQ_FAIL);
+    }
+
+  s->dequeued = dpaa2_ipsec_sum_error (vm, poll, DPAA2_IPSEC_POLL_ERROR_DEQ);
+  s->auth_fail =
+    dpaa2_ipsec_sum_error (vm, poll, DPAA2_IPSEC_POLL_ERROR_AUTH_FAIL);
+  s->status_fail =
+    dpaa2_ipsec_sum_error (vm, poll, DPAA2_IPSEC_POLL_ERROR_STATUS_FAIL);
+  s->straggler =
+    dpaa2_ipsec_sum_error (vm, poll, DPAA2_IPSEC_POLL_ERROR_STRAGGLER);
+}
+
+/*
+ * "test dpaa2-ipsec" - in-process unit test for the deferred-session drain state
+ * machine. Exercises the real dpaa2_ipsec_pending_retire() against
+ * synthetic pending entries: pointer-keyed matching, per-entry decrement, and
+ * reused-slot isolation (one session's completion never touches another's count).
+ * Board-free by construction -- it never drives an entry's remaining to zero, so
+ * it never reaches the device-coupled rte_security_session_destroy(); that single
+ * line stays covered by on-device validation. What a future edit could silently
+ * break -- match the wrong entry, decrement the wrong count, retire early -- is
+ * what is asserted here.
+ */
+static clib_error_t *
+dpaa2_ipsec_test_drain (vlib_main_t *vm, unformat_input_t *input,
+			vlib_cli_command_t *cmd)
+{
+  dpaa2_ipsec_worker_t w = { 0 };
+  void *sess_a = (void *) 0x1000, *sess_b = (void *) 0x2000,
+       *sess_unknown = (void *) 0x9999;
+  u64 drained0 = dpaa2_ipsec_main.sessions_drained;
+  u32 fails = 0;
+
+  dpaa2_ipsec_pending_destroy_t pa = { .session = sess_a, .remaining = 2,
+				       .is_ingress = 1 };
+  dpaa2_ipsec_pending_destroy_t pb = { .session = sess_b, .remaining = 2,
+				       .is_ingress = 0 };
+  vec_add1 (w.pending_destroy, pa);
+  vec_add1 (w.pending_destroy, pb);
+
+#define T(cond, msg)                                                          \
+  if (!(cond))                                                                \
+    {                                                                         \
+      vlib_cli_output (vm, "  FAIL: %s", msg);                               \
+      fails++;                                                                \
+    }
+
+  /* Unknown session: no match, returns -1, touches nothing. The poll node's
+   * contract on top of this: a completion that matches neither a live cache
+   * slot nor a pending entry (nor a pending entry it DID match but whose SA is
+   * gone) is DROPPED, never forwarded -- an ownerless packet's cached
+   * adjacency may already be recycled. */
+  T (dpaa2_ipsec_pending_retire (&w, sess_unknown) == -1, "unknown -> -1");
+  T (w.pending_destroy[0].remaining == 2 && w.pending_destroy[1].remaining == 2,
+     "unknown leaves every entry untouched");
+
+  /* Match A: returns A's direction (ingress), decrements A only. */
+  T (dpaa2_ipsec_pending_retire (&w, sess_a) == 1, "match A -> ingress");
+  T (w.pending_destroy[0].remaining == 1, "A's remaining decremented");
+  T (w.pending_destroy[1].remaining == 2, "B isolated from A's completion");
+
+  /* Match B: returns B's direction (egress), decrements B only. */
+  T (dpaa2_ipsec_pending_retire (&w, sess_b) == 0, "match B -> egress");
+  T (w.pending_destroy[1].remaining == 1, "B's remaining decremented");
+  T (w.pending_destroy[0].remaining == 1, "A unchanged by B's completion");
+
+  /* Unknown->drop is stable: still -1 after other sessions retired ops. */
+  T (dpaa2_ipsec_pending_retire (&w, sess_unknown) == -1,
+     "unknown stays -1 after other retires (poll drops it)");
+
+  /* Nothing reached zero, so nothing was retired or drained. */
+  T (vec_len (w.pending_destroy) == 2, "no entry retired before draining");
+  T (dpaa2_ipsec_main.sessions_drained == drained0, "drained counter untouched");
+#undef T
+
+  vec_free (w.pending_destroy);
+
+  if (fails)
+    return clib_error_return (0, "test dpaa2-ipsec: %u check(s) FAILED", fails);
+  vlib_cli_output (vm, "test dpaa2-ipsec drain state machine: PASS "
+		       "(match / decrement / isolation; free-at-zero is the "
+		       "device-coupled line, exercised on the device)");
+  return 0;
+}
+
+VLIB_CLI_COMMAND (dpaa2_ipsec_test_command, static) = {
+  .path = "test dpaa2-ipsec",
+  .short_help = "test dpaa2-ipsec (deferred-session drain state machine)",
+  .function = dpaa2_ipsec_test_drain,
+};
