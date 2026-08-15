@@ -213,6 +213,90 @@ class TestL2Flood(VppTestCase):
             )
         self.vapi.bridge_domain_add_del_v2(bd_id=1, is_add=0)
 
+    def flood_from_pg0(self, p):
+        self.pg0.add_stream(p * NUM_PKTS)
+        self.pg_enable_capture(self.pg_interfaces)
+        self.pg_start()
+
+    def tx_errors(self, i):
+        return self.statistics["/if/tx-error"][:, i.sw_if_index].sum()
+
+    def test_flood_member_down(self):
+        """L2 Flood to Down Members"""
+
+        #
+        # Create a single bridge Domain with three members
+        #
+        self.vapi.bridge_domain_add_del_v2(
+            bd_id=1, is_add=1, flood=1, uu_flood=1, forward=1, learn=1
+        )
+        for i in self.pg_interfaces[:3]:
+            self.vapi.sw_interface_set_l2_bridge(
+                rx_sw_if_index=i.sw_if_index, bd_id=1, shg=0
+            )
+
+        p = (
+            Ether(dst="ff:ff:ff:ff:ff:ff", src="00:00:de:ad:be:ef")
+            / IP(src="10.10.10.10", dst="1.1.1.1")
+            / UDP(sport=1234, dport=1234)
+            / Raw(b"\xa5" * 100)
+        )
+
+        #
+        # with all members up, a flood from pg0 is replicated to both others
+        #
+        self.flood_from_pg0(p)
+        self.pg1.get_capture(NUM_PKTS, timeout=1)
+        self.pg2.get_capture(NUM_PKTS, timeout=1)
+
+        #
+        # a member that goes down leaves the replication list. it receives
+        # nothing, and since it is not cloned to, its output node charges it
+        # no tx-error either
+        #
+        self.pg2.admin_down()
+        tx_error = self.tx_errors(self.pg2)
+
+        self.flood_from_pg0(p)
+        self.pg1.get_capture(NUM_PKTS, timeout=1)
+        self.pg2.assert_nothing_captured(remark="flood to a down member")
+        self.assertEqual(self.tx_errors(self.pg2), tx_error)
+
+        #
+        # and it is flooded to again once it comes back up
+        #
+        self.pg2.admin_up()
+
+        self.flood_from_pg0(p)
+        self.pg1.get_capture(NUM_PKTS, timeout=1)
+        self.pg2.get_capture(NUM_PKTS, timeout=1)
+
+        #
+        # an interface that is already down when it joins the bridge domain
+        # is excluded from the moment it is added
+        #
+        self.pg3.admin_down()
+        self.vapi.sw_interface_set_l2_bridge(
+            rx_sw_if_index=self.pg3.sw_if_index, bd_id=1, shg=0
+        )
+        tx_error = self.tx_errors(self.pg3)
+
+        self.flood_from_pg0(p)
+        self.pg1.get_capture(NUM_PKTS, timeout=1)
+        self.pg2.get_capture(NUM_PKTS, timeout=1)
+        self.pg3.assert_nothing_captured(remark="flood to a member added down")
+        self.assertEqual(self.tx_errors(self.pg3), tx_error)
+
+        #
+        # cleanup
+        #
+        self.pg3.admin_up()
+        for i in self.pg_interfaces[:4]:
+            self.vapi.sw_interface_set_l2_bridge(
+                rx_sw_if_index=i.sw_if_index, bd_id=1, enable=0
+            )
+        self.vapi.bridge_domain_add_del_v2(bd_id=1, is_add=0)
+
     def test_uu_fwd(self):
         """UU Flood"""
 
