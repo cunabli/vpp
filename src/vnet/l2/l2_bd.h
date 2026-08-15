@@ -39,6 +39,12 @@ extern bd_main_t bd_main;
 
 #define L2_FLOOD_MEMBER_NORMAL 0
 #define L2_FLOOD_MEMBER_BVI    1
+/*
+ * Set while the member is known to be unable to transmit, i.e. once an
+ * admin-down or link-down event has been observed for it. Flooding skips
+ * members with this bit set.
+ */
+#define L2_FLOOD_MEMBER_DOWN   2
 
 typedef struct
 {

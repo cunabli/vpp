@@ -136,12 +136,111 @@ update_flood_count (l2_bridge_domain_t * bd_config)
   bd_config->flood_count -= bd_config->no_flood_count;
 }
 
+/**
+ * Is the interface known to be unable to transmit?
+ *
+ * Mirrors the admin-up + link-up predicate the interface output node enforces,
+ * so flood and output never disagree about who may transmit.
+ *
+ * link_up: -1 reads the committed hardware flag; 0/1 is the authoritative
+ * state a link callback supplies. The core commits the hardware flag only
+ * after firing the link callback, so a callback re-reading it would miss the
+ * transition and never clear the bit on re-up. The admin flag is committed
+ * before its callback, so admin and insert callers read it live.
+ */
+static int
+bd_member_is_down (u32 sw_if_index, int link_up)
+{
+  vnet_main_t *vnm = vnet_get_main ();
+  vnet_sw_interface_t *sw_if = vnet_get_sw_interface (vnm, sw_if_index);
+
+  if (link_up < 0)
+    {
+      vnet_hw_interface_t *hw_if =
+	vnet_get_sup_hw_interface (vnm, sw_if_index);
+      link_up = (hw_if->flags & VNET_HW_INTERFACE_FLAG_LINK_UP) != 0;
+    }
+
+  return (!(sw_if->flags & VNET_SW_INTERFACE_FLAG_ADMIN_UP) || !link_up);
+}
+
+/**
+ * Refresh the no-flood bit of the interface's bridge member, if it has one.
+ * Called on each observed admin or link transition, so that the flood node
+ * never has to ask the hardware anything.
+ */
+static void
+bd_member_update_flood_state (u32 sw_if_index, int link_up)
+{
+  l2_bridge_domain_t *bd_config;
+  l2_input_config_t *config;
+  l2_flood_member_t *member;
+
+  if (sw_if_index >= vec_len (l2input_main.configs))
+    return;
+
+  config = vec_elt_at_index (l2input_main.configs, sw_if_index);
+  if (!l2_input_is_bridge (config))
+    return;
+
+  bd_config = l2input_bd_config (config->bd_index);
+
+  vec_foreach (member, bd_config->members)
+    {
+      if (member->sw_if_index == sw_if_index)
+	{
+	  if (bd_member_is_down (sw_if_index, link_up))
+	    member->flags |= L2_FLOOD_MEMBER_DOWN;
+	  else
+	    member->flags &= ~L2_FLOOD_MEMBER_DOWN;
+	  break;
+	}
+    }
+}
+
+static clib_error_t *
+bd_sw_interface_admin_up_down (vnet_main_t *vnm, u32 sw_if_index, u32 flags)
+{
+  /* the new admin state is already committed when this is called; the link
+     flag is read live (-1) */
+  bd_member_update_flood_state (sw_if_index, -1);
+  return 0;
+}
+
+VNET_SW_INTERFACE_ADMIN_UP_DOWN_FUNCTION (bd_sw_interface_admin_up_down);
+
+static walk_rc_t
+bd_member_link_state_change (vnet_main_t *vnm, u32 sw_if_index, void *ctx)
+{
+  bd_member_update_flood_state (sw_if_index, (int) (uword) ctx);
+  return WALK_CONTINUE;
+}
+
+static clib_error_t *
+bd_hw_interface_link_up_down (vnet_main_t *vnm, u32 hw_if_index, u32 flags)
+{
+  /* pass the callback's link state down: hw->flags is not committed until
+     after this returns, so the members cannot read it back live */
+  int link_up = (flags & VNET_HW_INTERFACE_FLAG_LINK_UP) != 0;
+
+  /* the sub-interfaces cannot transmit either */
+  vnet_hw_interface_walk_sw (vnm, hw_if_index, bd_member_link_state_change,
+			     (void *) (uword) link_up);
+  return 0;
+}
+
+VNET_HW_INTERFACE_LINK_UP_DOWN_FUNCTION (bd_hw_interface_link_up_down);
+
 void
 bd_add_member (l2_bridge_domain_t * bd_config, l2_flood_member_t * member)
 {
   u32 ix = 0;
   vnet_sw_interface_t *sw_if = vnet_get_sw_interface
     (vnet_get_main (), member->sw_if_index);
+
+  /* an interface that is already down when it joins is not flooded to */
+  if (bd_member_is_down (member->sw_if_index, -1))
+    member->flags |= L2_FLOOD_MEMBER_DOWN;
 
   /*
    * Add one element to the vector

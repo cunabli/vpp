@@ -177,6 +177,7 @@ VLIB_NODE_FN (l2flood_node) (vlib_main_t * vm,
 	    {
 	      member = &bd_config->members[mi];
 	      if ((member->sw_if_index != sw_if_index0) &&
+		  !(member->flags & L2_FLOOD_MEMBER_DOWN) &&
 		  (!in_shg || (member->shg != in_shg)))
 		{
 		  vec_add1 (msm->members[thread_index], member);
