@@ -562,6 +562,7 @@ format_vlib_buffer_pool (u8 * s, va_list * va)
   int detail = va_arg (*va, int);
   vlib_buffer_pool_thread_t *bpt;
   u32 cached = 0;
+  u32 avail;
 
   if (!bp)
     return format (s, "%-20s%=6s%=6s%=6s%=11s%=6s%=8s%=8s%=8s",
@@ -571,12 +572,13 @@ format_vlib_buffer_pool (u8 * s, va_list * va)
   vec_foreach (bpt, bp->threads)
     cached += bpt->n_cached;
 
+  avail = vlib_buffer_pool_available (vm, bp);
   s = format (s, "%-20v%=6d%=6d%=6u%=11u%=6u%=8u%=8u%=8u", bp->name, bp->index,
 	      bp->numa_node,
 	      bp->data_size + sizeof (vlib_buffer_t) +
 		vm->buffer_main->ext_hdr_size,
-	      bp->data_size, bp->n_buffers, bp->n_avail, cached,
-	      bp->n_buffers - bp->n_avail - cached);
+	      bp->data_size, bp->n_buffers, avail, cached,
+	      bp->n_buffers - avail - cached);
 
   if (detail)
     {
@@ -791,7 +793,8 @@ buffer_gauges_collect_used_fn (vlib_stats_collector_data_t *d)
   if (!bp)
     return;
 
-  d->entry->value = bp->n_buffers - bp->n_avail - buffer_get_cached (bp);
+  d->entry->value =
+    bp->n_buffers - vlib_buffer_pool_available (vm, bp) - buffer_get_cached (bp);
 }
 
 static void
@@ -803,7 +806,7 @@ buffer_gauges_collect_available_fn (vlib_stats_collector_data_t *d)
   if (!bp)
     return;
 
-  d->entry->value = bp->n_avail;
+  d->entry->value = vlib_buffer_pool_available (vm, bp);
 }
 
 static void
@@ -1009,6 +1012,24 @@ vlib_buffer_set_alloc_free_callback (
     return 1;
   bm->alloc_callback_fn = alloc_callback_fn;
   bm->free_callback_fn = free_callback_fn;
+  return 0;
+}
+
+__clib_export int
+vlib_buffer_pool_set_backend_ops (vlib_main_t *vm, u8 buffer_pool_index,
+				  vlib_buffer_pool_backend_ops_t ops)
+{
+  vlib_buffer_main_t *bm = vm->buffer_main;
+  vlib_buffer_pool_t *bp;
+
+  if (buffer_pool_index >= vec_len (bm->buffer_pools))
+    return -1;
+  /* both or neither: a backend that allocs but can't free would leak */
+  if ((ops.alloc != 0) != (ops.free != 0))
+    return -2;
+
+  bp = vec_elt_at_index (bm->buffer_pools, buffer_pool_index);
+  bp->backend_ops = ops;
   return 0;
 }
 
