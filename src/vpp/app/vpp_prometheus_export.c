@@ -157,7 +157,7 @@ int
 main (int argc, char **argv)
 {
   unformat_input_t _argv, *a = &_argv;
-  u8 *stat_segment_name, *pattern = 0, **patterns = 0;
+  u8 *stat_segment_name = 0, *pattern = 0, **patterns = 0;
   u16 port = SERVER_PORT;
   char *usage =
     "%s: usage [socket-name <name>] [port <0 - 65535>] [v2] <patterns> ...\n";
@@ -169,13 +169,11 @@ main (int argc, char **argv)
 
   unformat_init_command_line (a, argv);
 
-  stat_segment_name = (u8 *) STAT_SEGMENT_SOCKET_FILE;
-
   while (unformat_check_input (a) != UNFORMAT_END_OF_INPUT)
     {
       if (unformat (a, "socket-name %s", &stat_segment_name))
 	;
-      if (unformat (a, "v2"))
+      else if (unformat (a, "v2"))
 	v2 = 1;
       else if (unformat (a, "port %d", &port))
 	;
@@ -189,6 +187,11 @@ main (int argc, char **argv)
 	  exit (1);
 	}
     }
+
+  /* Apply the default only once parsing is done, so the socket name is never a
+     read-only string literal handed to unformat "%s" above. */
+  if (!stat_segment_name)
+    stat_segment_name = (u8 *) STAT_SEGMENT_SOCKET_FILE;
 
   if (vec_len (patterns) == 0)
     {
