@@ -245,6 +245,7 @@ typedef enum
 {
   VNET_DEV_ADDR_PCI,
   VNET_DEV_ADDR_VMBUS,
+  VNET_DEV_ADDR_NAME,
   VNET_DEV_ADDR_ANY,
 } dpdk_device_addr_type_t;
 
@@ -257,8 +258,14 @@ typedef struct
   };
   dpdk_device_addr_type_t dev_addr_type;
   u8 *name;
+  /* match key for VNET_DEV_ADDR_NAME (e.g. "fslmc:dpni.7"); distinct from
+     `name` (rename) */
+  u8 *dev_name_key;
   u8 *tag;
   u8 is_blacklisted;
+  /* set once a running port matches this block; used to warn about a
+     name-keyed block that matched nothing (typo or absent device) */
+  u8 matched;
 
 #define _(x) uword x;
     foreach_dpdk_device_config_item
@@ -304,6 +311,8 @@ typedef struct
   dpdk_device_config_t *dev_confs;
   uword *device_config_index_by_pci_addr;
   mhash_t device_config_index_by_vmbus_addr;
+  uword *device_config_index_by_name; /* string key "<bus>:<name>" -> devconf
+					 index */
 
   /* devices blacklist by pci vendor_id, device_id */
   u32 *blacklist_by_pci_vendor_and_device;

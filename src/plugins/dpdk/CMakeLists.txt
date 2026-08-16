@@ -172,3 +172,10 @@ add_vpp_plugin(dpdk
 add_vpp_test(test_dpaa2_ipsec_gate
   SOURCES dpaa2/ipsec/test_gate.c
 )
+
+# Host unit test for the bus-qualified device name key/match core (freestanding,
+# no VPP/DPDK link). The parser-level invariants that need the real
+# dpdk_device_config() are covered in-process by the "test dpdk dev-config" CLI.
+add_vpp_test(test_dpdk_dev_name_match
+  SOURCES device/test_dev_name_match.c
+)

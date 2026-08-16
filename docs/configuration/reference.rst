@@ -634,6 +634,36 @@ specified. Valid options include:
    dev 0000:02:00.0
    dev 0000:03:00.0
 
+dev <bus>:<name> { .. }
+^^^^^^^^^^^^^^^^^^^^^^^
+
+Match a port by its bus-qualified DPDK device name, for ports that have no PCI
+or VMBUS address (DPAA2 ports on the **fslmc** bus today). The block accepts
+every per-port option a PCI **dev** block does (**name**, **num-rx-desc**,
+**num-tx-desc**, queue counts, rss, ...) and inherits anything it does not set
+from **dev default**, exactly like a PCI block.
+
+Unlike a PCI **dev** block, this is a config-match only: it does not add the
+device to the EAL allowlist and emits no **-a** argument. fslmc ports are
+admitted container-wide via the **dpaa2 { dprc .. }** binding; this block only
+attaches settings to a port already admitted.
+
+The **<bus>:** prefix is required (namespaced match); a bare leaf name is
+rejected, so a leaf like **dpni.7** never cross-matches the same name on another
+bus. A block whose name matches no running port is logged as a warning at
+startup, so a typo (for example a PCI address missing its **.function**, which
+contains a colon and so lands here instead of on the PCI path) or an absent
+device is not silently ignored.
+
+.. code-block:: console
+
+   dpdk {
+      dev default        { num-rx-desc 512 num-tx-desc 512 }
+      dev fslmc:dpni.7   { name WAN }                        # rename; inherits 512/512
+      dev fslmc:dpni.9   { name LAN num-rx-desc 2048 }       # rename + deeper rx ring
+      dev 0000:01:00.0   { name FABRIC num-rx-desc 4096 }    # unchanged PCI path
+   }
+
 blacklist <pci-dev>
 ^^^^^^^^^^^^^^^^^^^
 

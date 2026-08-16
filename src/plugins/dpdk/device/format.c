@@ -472,6 +472,11 @@ format_dpdk_device (u8 * s, va_list * args)
 		  pci->addr.devid, pci->addr.function, s2);
       vec_free (s2);
     }
+  else
+    /* Busless ports (fslmc/dpni) have no PCI address; surface the DPDK
+       device identity instead so the dpni is visible here. */
+    s = format (s, "%Udevice: %U\n", format_white_space, indent + 2,
+		format_dpdk_rte_device, di.device);
 
   if (di.switch_info.domain_id != RTE_ETH_DEV_SWITCH_DOMAIN_ID_INVALID)
     {

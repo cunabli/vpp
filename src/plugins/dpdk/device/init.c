@@ -35,6 +35,7 @@
 #include <dirent.h>
 
 #include <dpdk/device/dpdk_priv.h>
+#include "dev_name_match.h"
 
 dpdk_main_t dpdk_main;
 dpdk_config_main_t dpdk_config_main;
@@ -212,8 +213,26 @@ dpdk_find_startup_config (struct rte_eth_dev_info *di)
     }
 #endif /* __linux__ */
 
+  if (!p)
+    {
+      const struct rte_bus *bus = rte_dev_bus (di->device);
+      const char *bus_name = bus ? rte_bus_name (bus) : 0;
+      const char *dev_name = rte_dev_name (di->device);
+      if (bus_name && dev_name)
+	{
+	  char key[256];
+	  if (dpdk_dev_name_key (bus_name, dev_name, key, sizeof (key)))
+	    p = hash_get_mem (dm->conf->device_config_index_by_name, key);
+	}
+    }
+
   if (p)
-    return pool_elt_at_index (dm->conf->dev_confs, p[0]);
+    {
+      dpdk_device_config_t *devconf =
+	pool_elt_at_index (dm->conf->dev_confs, p[0]);
+      devconf->matched = 1;
+      return devconf;
+    }
   return &dm->conf->default_devconf;
 }
 
@@ -645,6 +664,18 @@ dpdk_lib_init (dpdk_main_t * dm)
       dpdk_counters_xstats_init (xd);
     }
 
+  /* A name-keyed `dev <bus>:<name>` block that matched no port is silent
+     otherwise -- most likely a typo in the bus-qualified name, or a device
+     that never came up. PCI/VMBUS blocks have their own allowlist accounting;
+     name blocks do not, so warn here. */
+  {
+    dpdk_device_config_t *devconf;
+    pool_foreach (devconf, dm->conf->dev_confs)
+      if (devconf->dev_addr_type == VNET_DEV_ADDR_NAME && !devconf->matched)
+	dpdk_log_warn ("startup config `dev %v { ... }' matched no device",
+		       devconf->dev_name_key);
+  }
+
   for (int i = 0; i < vec_len (dm->devices); i++)
     vnet_hw_if_update_runtime_data (vnm, dm->devices[i].hw_if_index);
 
@@ -1005,6 +1036,22 @@ dpdk_device_config (dpdk_config_main_t *conf, void *addr,
 	  0, "duplicate configuration for VMBUS address %U",
 	  format_vlib_vmbus_addr, addr);
     }
+  else if (addr_type == VNET_DEV_ADDR_NAME)
+    {
+      p = hash_get_mem (conf->device_config_index_by_name, (char *) addr);
+
+      if (!p)
+	{
+	  pool_get (conf->dev_confs, devconf);
+	  /* keep the key on the devconf so the hash key memory is stable */
+	  devconf->dev_name_key = format (0, "%s%c", (char *) addr, 0);
+	  hash_set_mem (conf->device_config_index_by_name,
+			devconf->dev_name_key, devconf - conf->dev_confs);
+	}
+      else
+	return clib_error_return (
+	  0, "duplicate configuration for device name %s", (char *) addr);
+    }
 
   if (addr_type == VNET_DEV_ADDR_PCI)
     {
@@ -1017,6 +1064,11 @@ dpdk_device_config (dpdk_config_main_t *conf, void *addr,
       devconf->vmbus_addr = *((vlib_vmbus_addr_t *) (addr));
       devconf->tso = DPDK_DEVICE_TSO_DEFAULT;
       devconf->dev_addr_type = VNET_DEV_ADDR_VMBUS;
+    }
+  else if (addr_type == VNET_DEV_ADDR_NAME)
+    {
+      devconf->tso = DPDK_DEVICE_TSO_DEFAULT;
+      devconf->dev_addr_type = VNET_DEV_ADDR_NAME;
     }
 
   if (!input)
@@ -1164,6 +1216,7 @@ dpdk_config (vlib_main_t * vm, unformat_input_t * input)
   dpdk_device_config_t *devconf;
   vlib_pci_addr_t pci_addr = { 0 };
   vlib_vmbus_addr_t vmbus_addr = { 0 };
+  u8 *name_str = 0;
   unformat_input_t sub_input;
 #ifdef __linux
   vlib_thread_main_t *tm = vlib_get_thread_main ();
@@ -1187,6 +1240,7 @@ dpdk_config (vlib_main_t * vm, unformat_input_t * input)
   conf->device_config_index_by_pci_addr = hash_create (0, sizeof (uword));
   mhash_init (&conf->device_config_index_by_vmbus_addr, sizeof (uword),
 	      sizeof (vlib_vmbus_addr_t));
+  conf->device_config_index_by_name = hash_create_string (0, sizeof (uword));
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
@@ -1288,6 +1342,40 @@ dpdk_config (vlib_main_t * vm, unformat_input_t * input)
 	    return error;
 
 	  num_whitelisted++;
+	}
+      else if (unformat (input, "dev %s %U", &name_str,
+			 unformat_vlib_cli_sub_input, &sub_input))
+	{
+	  if (!strchr ((char *) name_str, ':'))
+	    {
+	      error = clib_error_return (
+		0, "device name `%s' must be bus-qualified as <bus>:<name>",
+		name_str);
+	      vec_free (name_str);
+	      return error;
+	    }
+	  error = dpdk_device_config (conf, name_str, VNET_DEV_ADDR_NAME,
+				      &sub_input, 0);
+	  vec_free (name_str);
+	  if (error)
+	    return error;
+	  /* config-match only: fslmc ports are admitted container-wide, so
+	     do NOT bump num_whitelisted or emit an EAL allowlist entry. */
+	}
+      else if (unformat (input, "dev %s", &name_str))
+	{
+	  if (!strchr ((char *) name_str, ':'))
+	    {
+	      error = clib_error_return (
+		0, "device name `%s' must be bus-qualified as <bus>:<name>",
+		name_str);
+	      vec_free (name_str);
+	      return error;
+	    }
+	  error = dpdk_device_config (conf, name_str, VNET_DEV_ADDR_NAME, 0, 0);
+	  vec_free (name_str);
+	  if (error)
+	    return error;
 	}
       else if (unformat (input, "uio-driver %s", &conf->uio_driver_name))
 	;
@@ -1489,28 +1577,33 @@ dpdk_config (vlib_main_t * vm, unformat_input_t * input)
 	fmt_addr = &devconf->vmbus_addr;
       }
 
-    /* add DPDK EAL whitelist/blacklist entry */
-    if (num_whitelisted > 0 && devconf->is_blacklisted == 0)
+    /* a NAME (fslmc) block is a config-match, not an EAL allowlist entry: it
+       has no valid pci/vmbus addr, so skip -a/-b emission for it. */
+    if (devconf->dev_addr_type != VNET_DEV_ADDR_NAME)
       {
-	tmp = format (0, "-a%c", 0);
-	vec_add1 (conf->eal_init_args, tmp);
-	if (devconf->devargs)
+	/* add DPDK EAL whitelist/blacklist entry */
+	if (num_whitelisted > 0 && devconf->is_blacklisted == 0)
 	  {
-	    tmp =
-	      format (0, "%U,%s%c", fmt_func, fmt_addr, devconf->devargs, 0);
+	    tmp = format (0, "-a%c", 0);
+	    vec_add1 (conf->eal_init_args, tmp);
+	    if (devconf->devargs)
+	      {
+		tmp = format (0, "%U,%s%c", fmt_func, fmt_addr, devconf->devargs,
+			      0);
+	      }
+	    else
+	      {
+		tmp = format (0, "%U%c", fmt_func, fmt_addr, 0);
+	      }
+	    vec_add1 (conf->eal_init_args, tmp);
 	  }
-	  else
+	else if (num_whitelisted == 0 && devconf->is_blacklisted != 0)
 	  {
+	    tmp = format (0, "-b%c", 0);
+	    vec_add1 (conf->eal_init_args, tmp);
 	    tmp = format (0, "%U%c", fmt_func, fmt_addr, 0);
+	    vec_add1 (conf->eal_init_args, tmp);
 	  }
-	  vec_add1 (conf->eal_init_args, tmp);
-      }
-    else if (num_whitelisted == 0 && devconf->is_blacklisted != 0)
-      {
-	tmp = format (0, "-b%c", 0);
-	vec_add1 (conf->eal_init_args, tmp);
-	tmp = format (0, "%U%c", fmt_func, fmt_addr, 0);
-	vec_add1 (conf->eal_init_args, tmp);
       }
   }
 
@@ -1784,3 +1877,140 @@ dpdk_worker_thread_init (vlib_main_t *vm)
 }
 
 VLIB_WORKER_INIT_FUNCTION (dpdk_worker_thread_init);
+
+/*
+ * Board-free, in-process gate for dpdk_device_config(). Drives the static
+ * dpdk_device_config() against a LOCAL config main (never the global
+ * dpdk_config_main) so it can run without any device present. It exercises the
+ * VNET_DEV_ADDR_NAME path (fslmc name keying + per-port options) and asserts
+ * the PCI path still parses, then prints PASS. A non-NULL clib_error_t is a
+ * FAIL that a Python "make test" case asserts on.
+ */
+static clib_error_t *
+test_dpdk_dev_config_fn (vlib_main_t *vm, unformat_input_t *cli_input,
+			 vlib_cli_command_t *cmd)
+{
+  dpdk_config_main_t conf = { 0 };
+  clib_error_t *error = 0;
+  unformat_input_t in;
+  uword *p;
+  dpdk_device_config_t *devconf;
+  vlib_pci_addr_t pci_addr;
+
+  /* set up the config main the same way dpdk_config() does */
+  conf.device_config_index_by_pci_addr = hash_create (0, sizeof (uword));
+  mhash_init (&conf.device_config_index_by_vmbus_addr, sizeof (uword),
+	      sizeof (vlib_vmbus_addr_t));
+  conf.device_config_index_by_name = hash_create_string (0, sizeof (uword));
+
+  /* 1. NAME create + keyed + options */
+  unformat_init_cstring (&in, "name WAN num-rx-desc 2048");
+  error = dpdk_device_config (&conf, "fslmc:dpni.7", VNET_DEV_ADDR_NAME, &in, 0);
+  unformat_free (&in);
+  if (error)
+    goto done;
+
+  p = hash_get_mem (conf.device_config_index_by_name, "fslmc:dpni.7");
+  if (!p)
+    {
+      error = clib_error_return (0, "NAME config not keyed by name");
+      goto done;
+    }
+  devconf = pool_elt_at_index (conf.dev_confs, p[0]);
+
+  if (devconf->dev_addr_type != VNET_DEV_ADDR_NAME)
+    {
+      error = clib_error_return (0, "NAME config has wrong dev_addr_type %d",
+				 devconf->dev_addr_type);
+      goto done;
+    }
+  if (!devconf->name || vec_len (devconf->name) != 3 ||
+      strncmp ((char *) devconf->name, "WAN", 3))
+    {
+      error = clib_error_return (0, "NAME config rename not applied");
+      goto done;
+    }
+  if (devconf->num_rx_desc != 2048)
+    {
+      error = clib_error_return (
+	0, "NAME config num-rx-desc = %u, expected 2048",
+	(u32) devconf->num_rx_desc);
+      goto done;
+    }
+  if (!devconf->dev_name_key ||
+      strcmp ((char *) devconf->dev_name_key, "fslmc:dpni.7"))
+    {
+      error = clib_error_return (0, "NAME config dev_name_key mismatch");
+      goto done;
+    }
+
+  /* 2. a NAME block must not emit any EAL argument */
+  if (vec_len (conf.eal_init_args) != 0)
+    {
+      error = clib_error_return (
+	0, "NAME config emitted %u EAL args, expected 0",
+	vec_len (conf.eal_init_args));
+      goto done;
+    }
+
+  /* 3. a duplicate NAME key must error */
+  error =
+    dpdk_device_config (&conf, "fslmc:dpni.7", VNET_DEV_ADDR_NAME, 0, 0);
+  if (!error)
+    {
+      error = clib_error_return (0, "duplicate NAME key did not error");
+      goto done;
+    }
+  clib_error_free (error);
+  error = 0;
+
+  /* 4. PCI still parses as PCI (ordering/regression) */
+  unformat_init_cstring (&in, "0000:01:00.0");
+  if (!unformat (&in, "%U", unformat_vlib_pci_addr, &pci_addr))
+    {
+      unformat_free (&in);
+      error = clib_error_return (0, "PCI address failed to unformat");
+      goto done;
+    }
+  unformat_free (&in);
+
+  error = dpdk_device_config (&conf, &pci_addr, VNET_DEV_ADDR_PCI, 0, 0);
+  if (error)
+    goto done;
+
+  p = hash_get (conf.device_config_index_by_pci_addr, pci_addr.as_u32);
+  if (!p)
+    {
+      error = clib_error_return (0, "PCI config not keyed by PCI address");
+      goto done;
+    }
+  devconf = pool_elt_at_index (conf.dev_confs, p[0]);
+  if (devconf->dev_addr_type != VNET_DEV_ADDR_PCI)
+    error = clib_error_return (0, "PCI config has wrong dev_addr_type %d",
+			       devconf->dev_addr_type);
+
+done:
+  pool_foreach (devconf, conf.dev_confs)
+    {
+      vec_free (devconf->name);
+      vec_free (devconf->dev_name_key);
+      vec_free (devconf->tag);
+    }
+  pool_free (conf.dev_confs);
+  vec_free (conf.eal_init_args);
+  hash_free (conf.device_config_index_by_pci_addr);
+  hash_free (conf.device_config_index_by_name);
+  mhash_free (&conf.device_config_index_by_vmbus_addr);
+
+  if (error)
+    return error;
+
+  vlib_cli_output (vm, "PASS");
+  return 0;
+}
+
+VLIB_CLI_COMMAND (test_dpdk_dev_config_command, static) = {
+  .path = "test dpdk dev-config",
+  .short_help = "test dpdk dev-config",
+  .function = test_dpdk_dev_config_fn,
+};
