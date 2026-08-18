@@ -319,6 +319,123 @@ class TestURPF(VppTestCase):
             sw_if_index=self.pg1.sw_if_index,
         )
 
+    def test_urpf6_link_local(self):
+        """uRPF IP6 link-local source"""
+
+        e = VppEnum
+
+        # A link-local source is on-link and reachable only through the
+        # interface it arrived on (its ll-FIB holds fe80::/10 as a glean via
+        # that interface). This mirrors a DHCPv6 Advertise/ND/RA sourced from a
+        # neighbour's fe80:: address. A global dst is used so the source-check
+        # verdict is observable as forward (pass) vs. no-reply (drop).
+        p_ll = (
+            Ether(dst=self.pg0.local_mac, src=self.pg0.remote_mac)
+            / IPv6(src=self.pg0.remote_ip6_ll, dst=self.pg1.remote_ip6)
+            / UDP(sport=1236, dport=1236)
+            / Raw(b"\xa5" * 100)
+        ) * N_PKTS
+        # A spoofed global source with no route must still be dropped: the
+        # link-local special case must not weaken anti-spoofing.
+        p_spoof_loose = (
+            Ether(dst=self.pg0.local_mac, src=self.pg0.remote_mac)
+            / IPv6(src="3::3", dst=self.pg1.remote_ip6)
+            / UDP(sport=1236, dport=1236)
+            / Raw(b"\xa5" * 100)
+        ) * N_PKTS
+
+        # uRPF drop counters are cumulative across the class, so assert the
+        # delta from a baseline captured here rather than an absolute value.
+        loose_drop = "/err/ip6-rx-urpf-loose/uRPF Drop"
+        strict_drop = "/err/ip6-rx-urpf-strict/uRPF Drop"
+        base_loose = self.statistics.get_err_counter(loose_drop)
+        base_strict = self.statistics.get_err_counter(strict_drop)
+
+        #
+        # loose uRPF: the link-local source resolves in the interface ll-FIB,
+        # so its uRPF list is non-empty and it passes; the global spoof drops
+        #
+        self.vapi.urpf_update(
+            is_input=True,
+            mode=e.vl_api_urpf_mode_t.URPF_API_MODE_LOOSE,
+            af=e.vl_api_address_family_t.ADDRESS_IP6,
+            sw_if_index=self.pg0.sw_if_index,
+        )
+        self.send_and_expect(self.pg0, p_ll, self.pg1)
+        self.send_and_assert_no_replies(self.pg0, p_spoof_loose)
+        self.assert_error_counter_equal(loose_drop, base_loose + N_PKTS)
+
+        #
+        # strict uRPF: the ll-FIB glean's uRPF list contains the rx interface,
+        # so the on-link link-local source passes; the global spoof still drops
+        #
+        self.vapi.urpf_update(
+            is_input=True,
+            mode=e.vl_api_urpf_mode_t.URPF_API_MODE_STRICT,
+            af=e.vl_api_address_family_t.ADDRESS_IP6,
+            sw_if_index=self.pg0.sw_if_index,
+        )
+        self.send_and_expect(self.pg0, p_ll, self.pg1)
+        self.send_and_assert_no_replies(self.pg0, p_spoof_loose)
+        self.assert_error_counter_equal(strict_drop, base_strict + N_PKTS)
+
+        # RX cleanup: disable so the TX arc below is exercised in isolation
+        # (an enabled RX check would intercept the spoof before it reaches TX).
+        self.vapi.urpf_update(
+            is_input=True,
+            mode=e.vl_api_urpf_mode_t.URPF_API_MODE_OFF,
+            af=e.vl_api_address_family_t.ADDRESS_IP6,
+            sw_if_index=self.pg0.sw_if_index,
+        )
+
+        #
+        # Now exercise the same link-local source on the TX (output-feature)
+        # arc, applied on the egress interface pg1. The packet still ingresses
+        # pg0 and forwards toward pg1 (dst is global), so the source-check runs
+        # as the packet leaves pg1.
+        #
+        loose_tx_drop = "/err/ip6-tx-urpf-loose/uRPF Drop"
+        strict_tx_drop = "/err/ip6-tx-urpf-strict/uRPF Drop"
+        base_loose_tx = self.statistics.get_err_counter(loose_tx_drop)
+        base_strict_tx = self.statistics.get_err_counter(strict_tx_drop)
+
+        #
+        # loose TX uRPF: the link-local source resolves in the ll-FIB, so its
+        # uRPF list is non-empty and it now passes (previously dropped); the
+        # routeless global spoof still drops.
+        #
+        self.vapi.urpf_update(
+            is_input=False,
+            mode=e.vl_api_urpf_mode_t.URPF_API_MODE_LOOSE,
+            af=e.vl_api_address_family_t.ADDRESS_IP6,
+            sw_if_index=self.pg1.sw_if_index,
+        )
+        self.send_and_expect(self.pg0, p_ll, self.pg1)
+        self.send_and_assert_no_replies(self.pg0, p_spoof_loose)
+        self.assert_error_counter_equal(loose_tx_drop, base_loose_tx + N_PKTS)
+
+        #
+        # strict TX uRPF: a link-local source is never forwarded off-link, so
+        # the ll-FIB glean's uRPF list contains the egress interface and strict
+        # TX drops it (would-forward-out-this-interface => drop).
+        #
+        self.vapi.urpf_update(
+            is_input=False,
+            mode=e.vl_api_urpf_mode_t.URPF_API_MODE_STRICT,
+            af=e.vl_api_address_family_t.ADDRESS_IP6,
+            sw_if_index=self.pg1.sw_if_index,
+        )
+        self.send_and_assert_no_replies(self.pg0, p_ll)
+        self.assert_error_counter_equal(strict_tx_drop, base_strict_tx + N_PKTS)
+
+        # TX cleanup
+        self.vapi.urpf_update(
+            is_input=False,
+            mode=e.vl_api_urpf_mode_t.URPF_API_MODE_OFF,
+            af=e.vl_api_address_family_t.ADDRESS_IP6,
+            sw_if_index=self.pg1.sw_if_index,
+        )
+
     def test_interface_dump(self):
         """uRPF Interface Dump"""
 

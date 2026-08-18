@@ -12,6 +12,7 @@
 #include <vnet/fib/ip6_fib.h>
 #include <vnet/fib/fib_urpf_list.h>
 #include <vnet/dpo/load_balance.h>
+#include <vnet/ip/ip6_ll_table.h>
 
 #include <urpf/urpf.h>
 
@@ -46,6 +47,22 @@ urpf_get_fib_index (vlib_buffer_t *b, ip_address_family_t af, vlib_dir_t dir)
   return vec_elt (urpf_cfgs[af][dir], sw_if_index).fib_index;
 }
 
+/* Link-local reachability lives only in the per-interface link-local FIB, not
+ * the unicast FIB. Resolve a link-local source there so on-link control traffic
+ * (DHCPv6/ND/RA) is not dropped; fall back to the unicast FIB otherwise. */
+static_always_inline u32
+urpf_ip6_src_fib_index (vlib_buffer_t *b, vlib_dir_t dir, u32 fib_index,
+			const ip6_header_t *ip)
+{
+  if (ip6_address_is_link_local_unicast (&ip->src_address))
+    {
+      u32 ll_fib_index = ip6_ll_fib_get (vnet_buffer (b)->sw_if_index[dir]);
+      if (~0 != ll_fib_index)
+	return ll_fib_index;
+    }
+  return fib_index;
+}
+
 static_always_inline void
 urpf_perform_check_x1 (ip_address_family_t af, vlib_dir_t dir,
 		       urpf_mode_t mode, vlib_buffer_t *b, const u8 *h,
@@ -75,7 +92,8 @@ urpf_perform_check_x1 (ip_address_family_t af, vlib_dir_t dir,
 
       ip = (ip6_header_t *) h;
 
-      lb_index = ip6_fib_table_fwding_lookup (fib_index, &ip->src_address);
+      lb_index = ip6_fib_table_fwding_lookup (
+	urpf_ip6_src_fib_index (b, dir, fib_index, ip), &ip->src_address);
       lpass = ip6_address_is_multicast (&ip->dst_address);
     }
 
@@ -137,8 +155,10 @@ urpf_perform_check_x2 (ip_address_family_t af, vlib_dir_t dir,
       ip0 = (ip6_header_t *) h0;
       ip1 = (ip6_header_t *) h1;
 
-      lb_index0 = ip6_fib_table_fwding_lookup (fib_index0, &ip0->src_address);
-      lb_index1 = ip6_fib_table_fwding_lookup (fib_index1, &ip1->src_address);
+      lb_index0 = ip6_fib_table_fwding_lookup (
+	urpf_ip6_src_fib_index (b0, dir, fib_index0, ip0), &ip0->src_address);
+      lb_index1 = ip6_fib_table_fwding_lookup (
+	urpf_ip6_src_fib_index (b1, dir, fib_index1, ip1), &ip1->src_address);
       lpass0 = ip6_address_is_multicast (&ip0->dst_address);
       lpass1 = ip6_address_is_multicast (&ip1->dst_address);
     }
@@ -237,7 +257,12 @@ urpf_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
 
 	  t = vlib_add_trace (vm, node, b[0], sizeof (*t));
 	  t->urpf = lb0 ? lb0->lb_urpf : ~0;
-	  t->fib_index = fib_index0;
+	  /* record the FIB the lookup actually used (ll-FIB for an ip6
+	   * link-local source) */
+	  t->fib_index = (AF_IP6 == af) ?
+			   urpf_ip6_src_fib_index (b[0], dir, fib_index0,
+						   (ip6_header_t *) h0) :
+			   fib_index0;
 	}
       if (b[1]->flags & VLIB_BUFFER_IS_TRACED)
 	{
@@ -245,7 +270,10 @@ urpf_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
 
 	  t = vlib_add_trace (vm, node, b[1], sizeof (*t));
 	  t->urpf = lb1 ? lb1->lb_urpf : ~0;
-	  t->fib_index = fib_index1;
+	  t->fib_index = (AF_IP6 == af) ?
+			   urpf_ip6_src_fib_index (b[1], dir, fib_index1,
+						   (ip6_header_t *) h1) :
+			   fib_index1;
 	}
 
       if (PREDICT_TRUE (pass0))
@@ -288,7 +316,12 @@ urpf_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
 
 	  t = vlib_add_trace (vm, node, b[0], sizeof (*t));
 	  t->urpf = lb0 ? lb0->lb_urpf : ~0;
-	  t->fib_index = fib_index0;
+	  /* record the FIB the lookup actually used (ll-FIB for an ip6
+	   * link-local source) */
+	  t->fib_index = (AF_IP6 == af) ?
+			   urpf_ip6_src_fib_index (b[0], dir, fib_index0,
+						   (ip6_header_t *) h0) :
+			   fib_index0;
 	}
 
       if (PREDICT_TRUE (pass0))
